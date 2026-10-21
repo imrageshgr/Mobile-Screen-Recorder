@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Rounded dark square badge -->
+    <path
+        android:fillColor="#1B1E26"
+        android:strokeColor="#363C4A"
+        android:strokeWidth="2.0"
+        android:pathData="M34,22 h40 a14,14 0 0 1 14,14 v36 a14,14 0 0 1 -14,14 h-40 a14,14 0 0 1 -14,-14 v-36 a14,14 0 0 1 14,-14 z" />
+
+    <!-- Subtle inner rim for depth -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#1FFFFFFF"
+        android:strokeWidth="1.0"
+        android:pathData="M35,24 h38 a12,12 0 0 1 12,12 v34 a12,12 0 0 1 -12,12 h-38 a12,12 0 0 1 -12,-12 v-34 a12,12 0 0 1 12,-12 z" />
+
+    <!-- Center red record halo / outer glow ring -->
+    <path
+        android:fillColor="#33FF3B30"
+        android:pathData="M54,54m-20,0a20,20 0 1,1 40,0a20,20 0 1,1 -40,0" />
+
+    <!-- Center red record ring stroke -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FF3B30"
+        android:strokeWidth="2.5"
+        android:pathData="M54,54m-14,0a14,14 0 1,1 28,0a14,14 0 1,1 -28,0" />
+
+    <!-- Central solid vivid red record circular symbol -->
+    <path
+        android:fillColor="#FF3B30"
+        android:pathData="M54,54m-8.5,0a8.5,8.5 0 1,1 17,0a8.5,8.5 0 1,1 -17,0" />
+</vector>

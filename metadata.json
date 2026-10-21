@@ -1,0 +1,6 @@
+{
+  "name": "Regonex Recorder",
+  "description": "Production-quality screen recorder with internal app audio, mic voice mixing, auto Do Not Disturb, and intelligent call pause.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
