@@ -14,7 +14,8 @@ data class RecordingItem(
     val durationMs: Long,
     val dateAddedMs: Long,
     val width: Int = 0,
-    val height: Int = 0
+    val height: Int = 0,
+    val isClip: Boolean = false
 ) {
     val formattedDuration: String
         get() {

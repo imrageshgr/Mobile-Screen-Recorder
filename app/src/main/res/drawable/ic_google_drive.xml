@@ -1,0 +1,19 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Google Drive Iconic Logo Shape -->
+    <!-- Yellow top/right band -->
+    <path
+        android:fillColor="#FFC107"
+        android:pathData="M16.14,3.27L7.86,17.61h5.36l8.28,-14.34H16.14z" />
+    <!-- Blue left band -->
+    <path
+        android:fillColor="#4285F4"
+        android:pathData="M7.86,3.27L2.5,12.56l4.14,7.18 5.36,-9.29L7.86,3.27z" />
+    <!-- Green bottom band -->
+    <path
+        android:fillColor="#34A853"
+        android:pathData="M6.64,19.74h12l2.68,-4.65H9.32L6.64,19.74z" />
+</vector>

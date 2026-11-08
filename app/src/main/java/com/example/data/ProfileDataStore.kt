@@ -46,8 +46,10 @@ class ProfileDataStore(private val context: Context) {
         private val KEY_SELECTED_FPS = intPreferencesKey("selected_fps")
         private val KEY_SELECTED_BITRATE = intPreferencesKey("selected_bitrate")
         private val KEY_SELECTED_AUDIO_SOURCE = stringPreferencesKey("selected_audio_source")
+        private val KEY_SELECTED_ORIENTATION = stringPreferencesKey("selected_orientation")
         private val KEY_ENABLE_OVERLAY_TRIGGER = booleanPreferencesKey("enable_overlay_trigger")
         private val KEY_INITIAL_SCAN_COMPLETED = booleanPreferencesKey("initial_hardware_scan_completed")
+        private val KEY_SHORT_CLIP_SECONDS = intPreferencesKey("short_clip_duration_seconds")
     }
 
     val savedProfile: Flow<DeviceProfile?> = context.dataStore.data
@@ -220,6 +222,14 @@ class ProfileDataStore(private val context: Context) {
         context.dataStore.edit { prefs -> prefs[KEY_VOICE_MODE] = mode }
     }
 
+    val selectedOrientation: Flow<String> = context.dataStore.data
+        .catch { emit(emptyPreferences()) }
+        .map { prefs -> prefs[KEY_SELECTED_ORIENTATION] ?: "AUTO" }
+
+    suspend fun setSelectedOrientation(orientation: String) {
+        context.dataStore.edit { prefs -> prefs[KEY_SELECTED_ORIENTATION] = orientation }
+    }
+
     suspend fun setEnableOverlayTrigger(enable: Boolean) {
         context.dataStore.edit { prefs -> prefs[KEY_ENABLE_OVERLAY_TRIGGER] = enable }
     }
@@ -230,5 +240,13 @@ class ProfileDataStore(private val context: Context) {
 
     suspend fun setInitialScanCompleted(completed: Boolean) {
         context.dataStore.edit { prefs -> prefs[KEY_INITIAL_SCAN_COMPLETED] = completed }
+    }
+
+    val shortClipDurationSeconds: Flow<Int> = context.dataStore.data
+        .catch { emit(emptyPreferences()) }
+        .map { prefs -> prefs[KEY_SHORT_CLIP_SECONDS] ?: 30 }
+
+    suspend fun setShortClipDurationSeconds(seconds: Int) {
+        context.dataStore.edit { prefs -> prefs[KEY_SHORT_CLIP_SECONDS] = seconds }
     }
 }

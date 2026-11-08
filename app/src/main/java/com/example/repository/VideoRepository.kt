@@ -36,10 +36,14 @@ class VideoRepository(private val context: Context) {
         const val LOCAL_RECORDINGS_DIR = "MyRecordings"
 
         /**
-         * Copies sourceFile into MediaStore.Video.Media under Movies/ScreenRecordings
+         * Copies sourceFile into MediaStore.Video.Media under Movies/{subDirectory}
          * with IS_PENDING = 1, copies byte stream, then updates IS_PENDING = 0.
          */
-        suspend fun saveVideoToMediaStore(context: Context, sourceFile: File): Uri? = withContext(Dispatchers.IO) {
+        suspend fun saveVideoToMediaStore(
+            context: Context,
+            sourceFile: File,
+            subDirectory: String = "Recordings"
+        ): Uri? = withContext(Dispatchers.IO) {
             if (!sourceFile.exists() || sourceFile.length() <= 0L) {
                 Log.e(TAG, "Source file does not exist or is empty: ${sourceFile.absolutePath}")
                 return@withContext null
@@ -73,12 +77,12 @@ class VideoRepository(private val context: Context) {
                 }
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/Recordings")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/$subDirectory")
                     put(MediaStore.Video.Media.IS_PENDING, 1)
                 } else {
                     @Suppress("DEPRECATION")
                     val moviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
-                    val targetDir = File(moviesDir, "Recordings")
+                    val targetDir = File(moviesDir, subDirectory)
                     if (!targetDir.exists()) targetDir.mkdirs()
                     val destFile = File(targetDir, sourceFile.name)
                     put(MediaStore.Video.Media.DATA, destFile.absolutePath)
@@ -110,7 +114,15 @@ class VideoRepository(private val context: Context) {
                     resolver.update(videoUri, updateValues, null, null)
                 }
 
-                scanMediaFile(context, videoUri)
+                try {
+                    MediaScannerConnection.scanFile(
+                        context,
+                        arrayOf(sourceFile.absolutePath),
+                        arrayOf("video/mp4"),
+                        null
+                    )
+                } catch (_: Exception) {}
+
                 Log.i(TAG, "Successfully exported video to MediaStore: $videoUri")
                 videoUri
             } catch (e: Exception) {
@@ -119,20 +131,6 @@ class VideoRepository(private val context: Context) {
                     try { resolver.delete(uri, null, null) } catch (_: Exception) {}
                 }
                 null
-            }
-        }
-
-        private suspend fun scanMediaFile(context: Context, uri: Uri) = suspendCancellableCoroutine<Unit> { cont ->
-            try {
-                MediaScannerConnection.scanFile(
-                    context,
-                    arrayOf(uri.toString()),
-                    arrayOf("video/mp4")
-                ) { _, _ ->
-                    if (cont.isActive) cont.resume(Unit)
-                }
-            } catch (_: Exception) {
-                if (cont.isActive) cont.resume(Unit)
             }
         }
     }
@@ -167,11 +165,11 @@ class VideoRepository(private val context: Context) {
         val selectionArgs: Array<String>
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            selection = "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ? OR ${MediaStore.Video.Media.RELATIVE_PATH} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ?"
-            selectionArgs = arrayOf("%Recordings%", "%ScreenRecordings%", "REC_%", "ScreenRecord_%", "regonex_%")
+            selection = "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ? OR ${MediaStore.Video.Media.RELATIVE_PATH} LIKE ? OR ${MediaStore.Video.Media.RELATIVE_PATH} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ?"
+            selectionArgs = arrayOf("%Recordings%", "%ScreenRecordings%", "%ShortClips%", "REC_%", "CLIP_%", "ScreenRecord_%", "regonex_%")
         } else {
-            selection = "${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ?"
-            selectionArgs = arrayOf("REC_%", "ScreenRecord_%", "regonex_%")
+            selection = "${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ? OR ${MediaStore.Video.Media.DISPLAY_NAME} LIKE ?"
+            selectionArgs = arrayOf("REC_%", "CLIP_%", "ScreenRecord_%", "regonex_%")
         }
 
         val sortOrder = "${MediaStore.Video.Media.DATE_ADDED} DESC"
@@ -201,6 +199,7 @@ class VideoRepository(private val context: Context) {
                     val dateAddedSec = cursor.getLong(dateCol)
                     val width = cursor.getInt(wCol)
                     val height = cursor.getInt(hCol)
+                    val isClip = rawName.startsWith("CLIP_", ignoreCase = true) || displayName.contains("clip", ignoreCase = true)
 
                     val uri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
 
@@ -216,7 +215,8 @@ class VideoRepository(private val context: Context) {
                                 durationMs = duration,
                                 dateAddedMs = if (dateAddedSec > 0) dateAddedSec * 1000L else System.currentTimeMillis(),
                                 width = width,
-                                height = height
+                                height = height,
+                                isClip = isClip
                             )
                         )
                     }
@@ -226,12 +226,16 @@ class VideoRepository(private val context: Context) {
             Log.e(TAG, "Error querying MediaStore recordings: ${e.message}", e)
         }
 
-        // 2. Query Local Files: Movies/MyRecordings and root Movies directory
+        // 2. Query Local Files: Movies/MyRecordings, Movies/ShortClips, and root Movies directory
         try {
             val searchDirs = mutableListOf<File>()
             val appRecordingsDir = File(context.getExternalFilesDir(null), "Recordings")
             if (appRecordingsDir.exists() && appRecordingsDir.isDirectory) {
                 searchDirs.add(appRecordingsDir)
+            }
+            val appClipsDir = File(context.getExternalFilesDir(null), "ShortClips")
+            if (appClipsDir.exists() && appClipsDir.isDirectory) {
+                searchDirs.add(appClipsDir)
             }
             val moviesDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
             if (moviesDir != null && moviesDir.exists()) {
@@ -240,11 +244,29 @@ class VideoRepository(private val context: Context) {
                 if (moviesRecDir.exists() && moviesRecDir.isDirectory) {
                     searchDirs.add(moviesRecDir)
                 }
+                val moviesClipsDir = File(moviesDir, "ShortClips")
+                if (moviesClipsDir.exists() && moviesClipsDir.isDirectory) {
+                    searchDirs.add(moviesClipsDir)
+                }
                 val myRecDir = File(moviesDir, LOCAL_RECORDINGS_DIR)
                 if (myRecDir.exists() && myRecDir.isDirectory) {
                     searchDirs.add(myRecDir)
                 }
             }
+
+            try {
+                @Suppress("DEPRECATION")
+                val publicMoviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+                if (publicMoviesDir != null && publicMoviesDir.exists()) {
+                    searchDirs.add(publicMoviesDir)
+                    val pubRec = File(publicMoviesDir, "Recordings")
+                    if (pubRec.exists() && pubRec.isDirectory) searchDirs.add(pubRec)
+                    val pubClips = File(publicMoviesDir, "ShortClips")
+                    if (pubClips.exists() && pubClips.isDirectory) searchDirs.add(pubClips)
+                    val pubScreenRec = File(publicMoviesDir, "ScreenRecordings")
+                    if (pubScreenRec.exists() && pubScreenRec.isDirectory) searchDirs.add(pubScreenRec)
+                }
+            } catch (_: Exception) {}
 
             for (dir in searchDirs) {
                 val localFiles = dir.listFiles { f ->
@@ -276,6 +298,10 @@ class VideoRepository(private val context: Context) {
                             Uri.fromFile(file)
                         }
 
+                        val isClip = rawName.startsWith("CLIP_", ignoreCase = true) ||
+                                file.parentFile?.name?.equals("ShortClips", ignoreCase = true) == true ||
+                                baseName.contains("clip", ignoreCase = true)
+
                         list.add(
                             RecordingItem(
                                 id = file.lastModified(),
@@ -285,7 +311,8 @@ class VideoRepository(private val context: Context) {
                                 durationMs = duration,
                                 dateAddedMs = file.lastModified(),
                                 width = width,
-                                height = height
+                                height = height,
+                                isClip = isClip
                             )
                         )
                     }
@@ -320,13 +347,22 @@ class VideoRepository(private val context: Context) {
                 targetDisplayName = file.nameWithoutExtension
                 if (file.exists() && file.delete()) {
                     deletedAny = true
+                    Log.d(TAG, "Deleted file URI directly: ${file.absolutePath}")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed deleting file URI: ${e.message}", e)
             }
         }
 
-        // 2. If it is a content URI, query display name and delete via ContentResolver
+        // 2. If it is a FileProvider URI, resolve direct file and delete
+        if (uri.scheme == "content" && uri.authority?.contains("fileprovider") == true) {
+            val lastSegment = uri.lastPathSegment?.substringAfterLast('/')
+            if (!lastSegment.isNullOrEmpty()) {
+                targetDisplayName = lastSegment.removeSuffix(".mp4")
+            }
+        }
+
+        // 3. If it is a MediaStore content URI, query display name and delete via ContentResolver
         if (uri.scheme == "content") {
             try {
                 context.contentResolver.query(
@@ -338,7 +374,9 @@ class VideoRepository(private val context: Context) {
                 )?.use { cursor ->
                     if (cursor.moveToFirst()) {
                         val name = cursor.getString(0)
-                        targetDisplayName = name?.removeSuffix(".mp4")
+                        if (!name.isNullOrEmpty()) {
+                            targetDisplayName = name.removeSuffix(".mp4")
+                        }
                     }
                 }
             } catch (_: Exception) {}
@@ -347,21 +385,29 @@ class VideoRepository(private val context: Context) {
                 val rows = context.contentResolver.delete(uri, null, null)
                 if (rows > 0) {
                     deletedAny = true
+                    Log.d(TAG, "ContentResolver delete deleted $rows row(s) for $uri")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "ContentResolver delete failed: ${e.message}", e)
+                Log.w(TAG, "ContentResolver delete: ${e.message}")
             }
         }
 
-        // 3. Delete matching local file in MyRecordings or Movies directory if present
+        // 4. Delete matching local file in Recordings, Movies, and MyRecordings
         try {
-            val moviesDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
             val searchDirs = mutableListOf<File>()
+            val appRecDir = File(context.getExternalFilesDir(null), "Recordings")
+            if (appRecDir.exists()) searchDirs.add(appRecDir)
+
+            val moviesDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
             if (moviesDir != null && moviesDir.exists()) {
                 searchDirs.add(moviesDir)
+                val moviesRec = File(moviesDir, "Recordings")
+                if (moviesRec.exists()) searchDirs.add(moviesRec)
                 val myRecDir = File(moviesDir, LOCAL_RECORDINGS_DIR)
                 if (myRecDir.exists()) searchDirs.add(myRecDir)
             }
+
+            val lastSegment = uri.lastPathSegment?.substringAfterLast('/')
 
             for (dir in searchDirs) {
                 val files = dir.listFiles() ?: emptyArray()
@@ -370,9 +416,13 @@ class VideoRepository(private val context: Context) {
                         file.nameWithoutExtension.equals(targetDisplayName, ignoreCase = true) ||
                         file.name.equals(targetDisplayName, ignoreCase = true)
                     )
+                    val matchesSegment = !lastSegment.isNullOrEmpty() && (
+                        file.name.equals(lastSegment, ignoreCase = true) ||
+                        file.nameWithoutExtension.equals(lastSegment.removeSuffix(".mp4"), ignoreCase = true)
+                    )
                     val matchesUri = uri.toString().contains(file.name)
 
-                    if (matchesName || matchesUri) {
+                    if (matchesName || matchesSegment || matchesUri) {
                         if (file.delete()) {
                             deletedAny = true
                             Log.d(TAG, "Deleted matching local file: ${file.absolutePath}")

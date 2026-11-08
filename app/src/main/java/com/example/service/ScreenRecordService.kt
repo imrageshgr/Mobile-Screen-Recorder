@@ -20,15 +20,18 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
@@ -37,6 +40,7 @@ import com.example.R
 import com.example.model.DiagnosticInfo
 import com.example.model.RecordingState
 import com.example.model.ServiceStatus
+import com.example.overlay.FloatingControlOverlay
 import com.example.repository.VideoRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -52,7 +56,8 @@ import java.util.Locale
 /**
  * ScreenRecordService
  * Bulletproof Android 14+ screen recording service utilizing native MediaRecorder
- * for zero frame loss, guaranteed MP4 file creation, and non-blocking foreground execution.
+ * for zero frame loss, guaranteed MP4 file creation, partial WakeLock against OEM kill timeouts,
+ * dynamic landscape/portrait orientation, and FLAG_SECURE floating controls.
  */
 class ScreenRecordService : Service() {
 
@@ -65,6 +70,7 @@ class ScreenRecordService : Service() {
         const val ACTION_STOP = "com.example.action.STOP_RECORDING"
         const val ACTION_PAUSE = "com.example.action.PAUSE_RECORDING"
         const val ACTION_RESUME = "com.example.action.RESUME_RECORDING"
+        const val ACTION_SHORT_CLIP = "com.example.action.SHORT_CLIP"
 
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
@@ -76,9 +82,13 @@ class ScreenRecordService : Service() {
         const val EXTRA_AUDIO_SOURCE = "extra_audio_source"
         const val EXTRA_ENABLE_OVERLAY = "extra_enable_overlay"
         const val EXTRA_RESOLUTION = "extra_resolution"
+        const val EXTRA_ORIENTATION = "extra_orientation"
+        const val EXTRA_ENABLE_FLOATING = "extra_enable_floating"
+        const val EXTRA_SHORT_CLIP_SECONDS = "extra_short_clip_seconds"
 
         const val AUDIO_SOURCE_INTERNAL = "INTERNAL"
         const val AUDIO_SOURCE_MIC = "MIC"
+        const val AUDIO_SOURCE_BOTH = "BOTH"
         const val AUDIO_SOURCE_MUTE = "MUTE"
 
         private val _isRecordingFlow = MutableStateFlow(false)
@@ -106,11 +116,15 @@ class ScreenRecordService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var mediaRecorder: MediaRecorder? = null
+    private var internalAudioRecorder: com.example.audio.InternalAudioRecorder? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     // State tracking
     private var isRecording = false
     private var isPaused = false
     private var currentOutputFile: File? = null
+    private var tempVideoFile: File? = null
+    private var tempAudioFile: File? = null
 
     // Configuration
     private var videoWidth = 1280
@@ -119,12 +133,18 @@ class ScreenRecordService : Service() {
     private var videoBitrate = 12_000_000
     private var audioSourceType = AUDIO_SOURCE_INTERNAL
     private var enableOverlayTrigger = false
+    private var enableFloatingButton = true
+    private var shortClipDurationSeconds = 30
+    private var pendingShortClipCount = 0
 
     // Notification & Timer
     private var timerJob: Job? = null
     private var totalElapsedSeconds = 0
 
-    // Overlay trigger view
+    // Floating UI controls
+    private var floatingOverlay: FloatingControlOverlay? = null
+
+    // Corner Hit Box overlay (optional backup)
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
 
@@ -136,22 +156,32 @@ class ScreenRecordService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action ?: return START_STICKY
+        if (intent == null) {
+            Log.w(TAG, "onStartCommand called with null intent. Stopping service to prevent ghost recordings.")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val action = intent.action ?: run {
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         when (action) {
             ACTION_START -> handleStart(intent)
             ACTION_STOP -> handleStopAndSave()
             ACTION_PAUSE -> handlePause()
             ACTION_RESUME -> handleResume()
+            ACTION_SHORT_CLIP -> handleTakeShortClip()
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         Log.i(TAG, "onTaskRemoved: App closed from recent apps. Foreground recording continues uninterrupted.")
-        // Do NOT stop recording when user swipes away app in recents!
-        // The foreground service continues recording until user taps Stop in notification or in-app.
+        // Do NOT stop recording when user swipes away app in recents.
+        // The foreground service continues recording until user taps Stop in floating button, notification, or in-app.
     }
 
     private fun handleStart(intent: Intent) {
@@ -173,27 +203,64 @@ class ScreenRecordService : Service() {
             return
         }
 
-        val rawWidth = intent.getIntExtra(EXTRA_WIDTH, 720)
-        val rawHeight = intent.getIntExtra(EXTRA_HEIGHT, 1280)
+        val rawWidth = intent.getIntExtra(EXTRA_WIDTH, 1280)
+        val rawHeight = intent.getIntExtra(EXTRA_HEIGHT, 720)
         val densityDpi = intent.getIntExtra(EXTRA_DENSITY_DPI, 400)
         videoFps = intent.getIntExtra(EXTRA_FPS, 60).coerceIn(24, 60)
         videoBitrate = intent.getIntExtra(EXTRA_BITRATE, 12_000_000)
         audioSourceType = intent.getStringExtra(EXTRA_AUDIO_SOURCE) ?: AUDIO_SOURCE_INTERNAL
         enableOverlayTrigger = intent.getBooleanExtra(EXTRA_ENABLE_OVERLAY, false)
+        enableFloatingButton = intent.getBooleanExtra(EXTRA_ENABLE_FLOATING, true)
+        shortClipDurationSeconds = intent.getIntExtra(EXTRA_SHORT_CLIP_SECONDS, 30).coerceAtLeast(5)
 
-        // STRICT 16-ALIGNED RESOLUTION
-        // Divisible by 16 for universal MediaTek, Snapdragon, Exynos compatibility
-        val isPortrait = resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE
-        val is1080p = maxOf(rawWidth, rawHeight) >= 1400 || intent.getStringExtra(EXTRA_RESOLUTION) == "1080p"
-        if (is1080p) {
-            videoWidth = if (isPortrait) 1088 else 1920
-            videoHeight = if (isPortrait) 1920 else 1088
-        } else {
-            videoWidth = if (isPortrait) 720 else 1280
-            videoHeight = if (isPortrait) 1280 else 720
+        // ORIENTATION CALCULATION:
+        // Solves the "smaller video in a video" issue with accurate automatic detection:
+        // Automatically detects when a game or movie is played horizontally, while vertical apps remain portrait.
+        val orientationPref = intent.getStringExtra(EXTRA_ORIENTATION) ?: "AUTO"
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        @Suppress("DEPRECATION")
+        val currentRotation = wm.defaultDisplay.rotation
+        val isDeviceCurrentlyLandscape = currentRotation == Surface.ROTATION_90 || currentRotation == Surface.ROTATION_270
+
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(metrics)
+        val isScreenWiderThanTall = metrics.widthPixels > metrics.heightPixels
+
+        val shouldRecordLandscape = when (orientationPref) {
+            "LANDSCAPE" -> true
+            "PORTRAIT" -> false
+            else -> isDeviceCurrentlyLandscape ||
+                    resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE ||
+                    isScreenWiderThanTall
         }
 
-        // Rule 2: Start foreground service BEFORE getMediaProjection
+        val is1080p = maxOf(rawWidth, rawHeight) >= 1400 || intent.getStringExtra(EXTRA_RESOLUTION) == "1080p"
+        if (is1080p) {
+            videoWidth = if (shouldRecordLandscape) 1920 else 1080
+            videoHeight = if (shouldRecordLandscape) 1080 else 1920
+        } else {
+            videoWidth = if (shouldRecordLandscape) 1280 else 720
+            videoHeight = if (shouldRecordLandscape) 720 else 1280
+        }
+
+        // Strictly ensure even dimensions for hardware encoder compatibility
+        videoWidth = (videoWidth / 2) * 2
+        videoHeight = (videoHeight / 2) * 2
+
+        // 1. Acquire Partial WakeLock to prevent CPU power-management and OEM battery killer timeouts (~1.45 mins)
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ScreenRecordService::RecordingWakeLock").apply {
+                setReferenceCounted(false)
+                acquire(4 * 60 * 60 * 1000L) // 4 hours maximum timeout
+            }
+            logDebug("WAKELOCK", "Acquired partial WakeLock for recording session")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not acquire WakeLock: ${e.message}")
+        }
+
+        // 2. Start foreground service BEFORE getMediaProjection (Required on Android 14+)
         startForegroundServiceWithNotification()
 
         serviceScope.launch(Dispatchers.IO) {
@@ -216,7 +283,7 @@ class ScreenRecordService : Service() {
         val notification = buildNotification("Starting recording...", 0)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             var serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            if (audioSourceType == AUDIO_SOURCE_MIC || audioSourceType == AUDIO_SOURCE_INTERNAL) {
+            if (audioSourceType == AUDIO_SOURCE_MIC || audioSourceType == AUDIO_SOURCE_INTERNAL || audioSourceType == AUDIO_SOURCE_BOTH) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     serviceType = serviceType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 }
@@ -229,9 +296,9 @@ class ScreenRecordService : Service() {
 
     @SuppressLint("WrongConstant")
     private fun startRecordingPipeline(resultCode: Int, resultData: Intent, densityDpi: Int) {
-        logDebug("PIPELINE", "Preparing output file...")
+        logDebug("PIPELINE", "Preparing output file for recording (${videoWidth}x${videoHeight})...")
 
-        // Prepare output directories (both external app files and Movies/Recordings)
+        // Prepare output directories
         val recordingsDir = File(getExternalFilesDir(null), "Recordings").apply {
             if (!exists()) mkdirs()
         }
@@ -246,7 +313,20 @@ class ScreenRecordService : Service() {
             android.Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
 
-        val audioEnabled = (audioSourceType == AUDIO_SOURCE_MIC || audioSourceType == AUDIO_SOURCE_INTERNAL) && hasMicPermission
+        // Audio mode definitions:
+        // 1. MIC ONLY: MediaRecorder records directly from hardware MIC.
+        // 2. INTERNAL ONLY: MediaRecorder captures video surface; InternalAudioRecorder captures system playback (MIC MUTED).
+        // 3. BOTH: MediaRecorder captures video surface; InternalAudioRecorder captures and mixes playback + MIC.
+        // 4. MUTE: Video surface only, zero audio tracks.
+        val isDirectMic = audioSourceType == AUDIO_SOURCE_MIC && hasMicPermission
+        val isInternalAudio = (audioSourceType == AUDIO_SOURCE_INTERNAL || audioSourceType == AUDIO_SOURCE_BOTH)
+
+        val videoOutputFile = if (isInternalAudio) {
+            File(recordingsDir, "temp_video_${System.currentTimeMillis()}.mp4")
+        } else {
+            outputFile
+        }
+        tempVideoFile = videoOutputFile
 
         // Rule 3: MediaRecorder EXACT mandatory state-machine setup order
         val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -257,8 +337,22 @@ class ScreenRecordService : Service() {
         }
         mediaRecorder = recorder
 
-        // 1. Audio Source (ONLY if audio enabled and permission granted)
-        if (audioEnabled) {
+        // Attach listeners to detect unexpected hardware encoder events
+        recorder.setOnErrorListener { _, what, extra ->
+            Log.w(TAG, "MediaRecorder error callback: what=$what, extra=$extra (in-game audio/mic transition handled)")
+            // Do not immediately kill video recording if in-game voice chat or transient mic contention occurs
+        }
+        recorder.setOnInfoListener { _, what, extra ->
+            Log.i(TAG, "MediaRecorder info callback: what=$what, extra=$extra")
+            if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED ||
+                what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED
+            ) {
+                handleStopAndSave()
+            }
+        }
+
+        // 1. Audio Source (ONLY set on MediaRecorder when specifically recording direct Microphone)
+        if (isDirectMic) {
             try {
                 recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
             } catch (e: Exception) {
@@ -273,7 +367,7 @@ class ScreenRecordService : Service() {
         recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
 
         // 4. Output File
-        recorder.setOutputFile(outputFile.absolutePath)
+        recorder.setOutputFile(videoOutputFile.absolutePath)
 
         // 5. Video Size
         recorder.setVideoSize(videoWidth, videoHeight)
@@ -281,8 +375,8 @@ class ScreenRecordService : Service() {
         // 6. Video Encoder
         recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
 
-        // 7. Audio Encoder (if audio enabled)
-        if (audioEnabled) {
+        // 7. Audio Encoder (Only for direct Microphone)
+        if (isDirectMic) {
             try {
                 recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
                 recorder.setAudioSamplingRate(44100)
@@ -336,6 +430,25 @@ class ScreenRecordService : Service() {
         logDebug("START", "Starting MediaRecorder...")
         recorder.start()
 
+        // 13. Start Internal Audio Capture (or Both Game + Mic) if selected
+        if (isInternalAudio && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val audioFile = File(recordingsDir, "temp_audio_${System.currentTimeMillis()}.mp4")
+            tempAudioFile = audioFile
+            val recorderEngine = com.example.audio.InternalAudioRecorder(
+                context = this,
+                mediaProjection = projection,
+                outputFile = audioFile,
+                includeMic = (audioSourceType == AUDIO_SOURCE_BOTH)
+            )
+            val audioStarted = recorderEngine.start()
+            if (audioStarted) {
+                internalAudioRecorder = recorderEngine
+                logDebug("INTERNAL_AUDIO", "Internal audio capture started (includeMic=${audioSourceType == AUDIO_SOURCE_BOTH})")
+            } else {
+                logDebug("INTERNAL_AUDIO_WARN", "Internal audio capture could not start, video only")
+            }
+        }
+
         isRecording = true
         isPaused = false
         _isRecordingFlow.value = true
@@ -343,7 +456,7 @@ class ScreenRecordService : Service() {
         _serviceStatus.value = ServiceStatus(
             state = RecordingState.RECORDING,
             elapsedSeconds = 0,
-            isMicEnabled = audioEnabled,
+            isMicEnabled = isDirectMic || audioSourceType == AUDIO_SOURCE_BOTH,
             diagnostic = DiagnosticInfo(
                 lastLogMessage = "Recording Active: ${videoWidth}x${videoHeight} @ ${videoFps}fps",
                 step = "RECORDING",
@@ -359,7 +472,7 @@ class ScreenRecordService : Service() {
 
         serviceScope.launch(Dispatchers.Main) {
             startTimer()
-            setupInvisibleOverlayTrigger()
+            setupFloatingControlOverlay()
         }
 
         logDebug("RECORDING_ACTIVE", "Screen recording started successfully into ${outputFile.name}")
@@ -372,6 +485,7 @@ class ScreenRecordService : Service() {
                 mediaRecorder?.pause()
             }
             isPaused = true
+            floatingOverlay?.setPaused(true)
             _serviceStatus.value = _serviceStatus.value.copy(state = RecordingState.PAUSED)
             updateNotification("Recording Paused")
             logDebug("PAUSE", "Recording paused")
@@ -387,6 +501,7 @@ class ScreenRecordService : Service() {
                 mediaRecorder?.resume()
             }
             isPaused = false
+            floatingOverlay?.setPaused(false)
             _serviceStatus.value = _serviceStatus.value.copy(state = RecordingState.RECORDING)
             updateNotification("Recording: ${formatTime(totalElapsedSeconds)}")
             logDebug("RESUME", "Recording resumed")
@@ -404,7 +519,7 @@ class ScreenRecordService : Service() {
         isRecording = false
         isPaused = false
 
-        removeInvisibleOverlayTrigger()
+        removeOverlays()
         timerJob?.cancel()
 
         _serviceStatus.value = _serviceStatus.value.copy(state = RecordingState.PROCESSING)
@@ -418,19 +533,12 @@ class ScreenRecordService : Service() {
 
     private suspend fun performFinalizeAndSave() {
         try {
-            // Rule 4: Order of teardown
-            // 1. Stop and release virtual display first
-            try {
-                virtualDisplay?.release()
-            } catch (e: Exception) {
-                Log.w(TAG, "VirtualDisplay release: ${e.message}")
-            }
-            virtualDisplay = null
+            // Ensure at least minimum frames are flushed to hardware surface
+            delay(250)
 
-            // Small delay to ensure all buffers flush to hardware surface
-            delay(100)
-
-            // 2. Stop and release MediaRecorder
+            // 1. Stop and release MediaRecorder FIRST while VirtualDisplay surface is still active!
+            // CRITICAL: Releasing VirtualDisplay before MediaRecorder causes native MediaRecorder::stop()
+            // to throw RuntimeException: stop failed (-1007), corrupting the MP4 header/moov atom.
             try {
                 mediaRecorder?.stop()
                 logDebug("RECORDER_STOP", "MediaRecorder stopped successfully")
@@ -440,11 +548,21 @@ class ScreenRecordService : Service() {
 
             try {
                 mediaRecorder?.reset()
+            } catch (_: Exception) {}
+            try {
                 mediaRecorder?.release()
             } catch (e: Exception) {
                 Log.w(TAG, "MediaRecorder release: ${e.message}")
             }
             mediaRecorder = null
+
+            // 2. Now safely release VirtualDisplay
+            try {
+                virtualDisplay?.release()
+            } catch (e: Exception) {
+                Log.w(TAG, "VirtualDisplay release: ${e.message}")
+            }
+            virtualDisplay = null
 
             // 3. Stop MediaProjection
             try {
@@ -454,19 +572,91 @@ class ScreenRecordService : Service() {
             }
             mediaProjection = null
 
-            // 4. Back-Test Verification Step: check file exists and length > 0
+            // 4. Stop and release InternalAudioRecorder
+            try {
+                internalAudioRecorder?.stop()
+            } catch (e: Exception) {
+                Log.w(TAG, "InternalAudioRecorder stop: ${e.message}")
+            }
+            internalAudioRecorder = null
+
             val outputFile = currentOutputFile
+
+            // 5. Merge video and internal audio tracks if applicable
+            val vidFile = tempVideoFile
+            val audFile = tempAudioFile
+            if (outputFile != null && vidFile != null && vidFile != outputFile && vidFile.exists() && vidFile.length() > 0L) {
+                var mergedSuccess = false
+                if (audFile != null && audFile.exists() && audFile.length() > 2048L) {
+                    logDebug("MERGE", "Merging audio track into output MP4...")
+                    mergedSuccess = com.example.recorder.AudioMuxerHelper.mergeVideoAndAudio(vidFile, audFile, outputFile)
+                }
+
+                // If merge was not possible, failed, or audio was missing/empty, preserve raw video directly!
+                if (!mergedSuccess || !outputFile.exists() || outputFile.length() <= 0L) {
+                    logDebug("DIRECT_COPY", "Preserving video file directly into output MP4...")
+                    try {
+                        vidFile.copyTo(outputFile, overwrite = true)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error copying vidFile to outputFile: ${e.message}")
+                    }
+                }
+
+                // Only delete temp files once outputFile is confirmed written
+                if (outputFile.exists() && outputFile.length() > 0L) {
+                    try { vidFile.delete() } catch (_: Exception) {}
+                    try { audFile?.delete() } catch (_: Exception) {}
+                }
+                tempVideoFile = null
+                tempAudioFile = null
+            }
+
+            // 6. Release WakeLock
+            try {
+                if (wakeLock?.isHeld == true) {
+                    wakeLock?.release()
+                }
+            } catch (_: Exception) {}
+            wakeLock = null
+
+            // 7. Back-Test Verification Step: check file exists and length > 0
             val fileExists = outputFile != null && outputFile.exists() && outputFile.length() > 0L
 
             if (fileExists && outputFile != null) {
                 val sizeBytes = outputFile.length()
                 logDebug("FILE_VERIFIED", "File verified! Size: $sizeBytes bytes (${outputFile.name})")
 
-                // Export to public MediaStore Movies/ScreenRecordings
-                val savedUri = VideoRepository.saveVideoToMediaStore(this@ScreenRecordService, outputFile)
-                val finalUri = savedUri ?: Uri.fromFile(outputFile)
+                // Export to public MediaStore Movies/Recordings
+                var finalUri: Uri? = null
+                try {
+                    finalUri = VideoRepository.saveVideoToMediaStore(this@ScreenRecordService, outputFile)
+                } catch (e: Exception) {
+                    Log.w(TAG, "MediaStore export failed, fallback to file URI: ${e.message}")
+                }
+                if (finalUri == null) {
+                    finalUri = Uri.fromFile(outputFile)
+                }
 
                 logDebug("SAVED", "Video saved successfully: ${outputFile.name} ($sizeBytes bytes)")
+
+                // Extract any bookmarked short clips into dedicated ShortClips directory
+                if (pendingShortClipCount > 0) {
+                    logDebug("CLIP_EXTRACT", "Extracting $pendingShortClipCount short clip(s) of ${shortClipDurationSeconds}s...")
+                    try {
+                        val clipResult = com.example.recorder.ShortClipExtractor.extractShortClip(
+                            context = this@ScreenRecordService,
+                            sourceVideoFile = outputFile,
+                            clipDurationSeconds = shortClipDurationSeconds
+                        )
+                        if (clipResult != null) {
+                            val (clipFile, _) = clipResult
+                            logDebug("CLIP_SUCCESS", "Short clip created: ${clipFile.name} (${clipFile.length()}b)")
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Error extracting short clip: ${e.message}")
+                    }
+                    pendingShortClipCount = 0
+                }
 
                 _lastSavedVideoTimestamp.value = System.currentTimeMillis()
                 _isRecordingFlow.value = false
@@ -525,27 +715,62 @@ class ScreenRecordService : Service() {
                 delay(1000)
                 if (!isPaused) {
                     totalElapsedSeconds++
-                    val currentSize = currentOutputFile?.length() ?: 0L
+                    val timeStr = formatTime(totalElapsedSeconds)
+                    floatingOverlay?.updateTimer(timeStr)
+
+                    // Throttle notification updates to every 2 seconds to avoid notification manager rate limits
+                    if (totalElapsedSeconds % 2 == 0) {
+                        updateNotification("Recording: $timeStr")
+                    }
+
                     _serviceStatus.value = _serviceStatus.value.copy(
-                        elapsedSeconds = totalElapsedSeconds.toLong(),
-                        diagnostic = _serviceStatus.value.diagnostic.copy(
-                            fileSizeBytes = currentSize,
-                            muxerStarted = true,
-                            videoTrackRegistered = true,
-                            audioTrackRegistered = audioSourceType != AUDIO_SOURCE_MUTE,
-                            lastLogMessage = "Recording MP4 (${totalElapsedSeconds}s | ${currentSize / 1024} KB)"
-                        )
+                        elapsedSeconds = totalElapsedSeconds.toLong()
                     )
-                    updateNotification("Recording: ${formatTime(totalElapsedSeconds)}")
                 }
             }
         }
     }
 
-    private fun setupInvisibleOverlayTrigger() {
-        if (!enableOverlayTrigger || !Settings.canDrawOverlays(this)) {
+    private fun handleTakeShortClip() {
+        if (!isRecording) {
+            logDebug("CLIP_WARN", "Cannot take short clip: no active recording")
             return
         }
+
+        pendingShortClipCount++
+        logDebug("SHORT_CLIP", "Short clip bookmarked! Total clips pending: $pendingShortClipCount")
+        floatingOverlay?.notifyClipSaved("Clip bookmarked!")
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(this, "Short clip bookmarked (${shortClipDurationSeconds}s). Will be saved to ShortClips folder!", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun setupFloatingControlOverlay() {
+        if (!enableFloatingButton || !Settings.canDrawOverlays(this)) {
+            if (enableOverlayTrigger) setupInvisibleOverlayTrigger()
+            return
+        }
+
+        try {
+            floatingOverlay?.dismiss()
+            floatingOverlay = FloatingControlOverlay(
+                context = this@ScreenRecordService,
+                onPauseClick = { handlePause() },
+                onResumeClick = { handleResume() },
+                onStopClick = { handleStopAndSave() },
+                onShortClipClick = { handleTakeShortClip() }
+            ).apply {
+                show()
+            }
+            logDebug("SIDE_SLIDER", "Side slider edge controls initialized")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not initialize side slider overlay: ${e.message}")
+            if (enableOverlayTrigger) setupInvisibleOverlayTrigger()
+        }
+    }
+
+    private fun setupInvisibleOverlayTrigger() {
+        if (!enableOverlayTrigger || !Settings.canDrawOverlays(this)) return
 
         try {
             windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -587,7 +812,12 @@ class ScreenRecordService : Service() {
         }
     }
 
-    private fun removeInvisibleOverlayTrigger() {
+    private fun removeOverlays() {
+        try {
+            floatingOverlay?.dismiss()
+            floatingOverlay = null
+        } catch (_: Exception) {}
+
         try {
             if (overlayView != null && windowManager != null) {
                 windowManager?.removeView(overlayView)
@@ -676,16 +906,32 @@ class ScreenRecordService : Service() {
 
     override fun onDestroy() {
         if (isRecording) {
-            Log.i(TAG, "onDestroy called while recording: performing emergency synchronous finalization")
+            Log.i(TAG, "onDestroy called while recording: performing emergency finalization")
             try {
+                // Must stop MediaRecorder before releasing VirtualDisplay to avoid native crash
+                try {
+                    mediaRecorder?.stop()
+                } catch (_: Exception) {}
+                try {
+                    mediaRecorder?.reset()
+                    mediaRecorder?.release()
+                } catch (_: Exception) {}
+                mediaRecorder = null
+
                 virtualDisplay?.release()
                 virtualDisplay = null
-                mediaRecorder?.stop()
-                mediaRecorder?.reset()
-                mediaRecorder?.release()
-                mediaRecorder = null
                 mediaProjection?.stop()
                 mediaProjection = null
+
+                try {
+                    internalAudioRecorder?.stop()
+                } catch (_: Exception) {}
+                internalAudioRecorder = null
+
+                if (wakeLock?.isHeld == true) {
+                    wakeLock?.release()
+                }
+                wakeLock = null
 
                 currentOutputFile?.let { file ->
                     if (file.exists() && file.length() > 0) {
@@ -700,7 +946,7 @@ class ScreenRecordService : Service() {
         }
 
         isRecording = false
-        removeInvisibleOverlayTrigger()
+        removeOverlays()
         timerJob?.cancel()
         _isRecordingFlow.value = false
         super.onDestroy()

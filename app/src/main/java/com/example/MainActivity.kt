@@ -55,11 +55,16 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VideoLibrary
+import android.os.PowerManager
+import androidx.compose.material.icons.filled.BatteryAlert
+import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Surface
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
@@ -162,6 +167,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val batteryOptLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { /* User returned from battery optimization settings */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -185,7 +194,19 @@ class MainActivity : ComponentActivity() {
             val selectedFps by viewModel.selectedFps.collectAsState()
             val selectedBitrate by viewModel.selectedBitrate.collectAsState()
             val selectedAudioSource by viewModel.selectedAudioSource.collectAsState()
+            val selectedOrientation by viewModel.selectedOrientation.collectAsState()
+            val isFloatingButtonEnabled by viewModel.isFloatingButtonEnabled.collectAsState()
+            val shortClipDurationSeconds by viewModel.shortClipDurationSeconds.collectAsState()
             val enableOverlayTrigger by viewModel.enableOverlayTrigger.collectAsState()
+
+            val powerManager = remember { getSystemService(Context.POWER_SERVICE) as PowerManager }
+            var isBatteryOptIgnored by remember {
+                mutableStateOf(
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        powerManager.isIgnoringBatteryOptimizations(packageName)
+                    } else true
+                )
+            }
             val countdownValue by viewModel.countdownValue.collectAsState()
             val activePlayingItem by viewModel.activePlayingItem.collectAsState()
             val selectedItemForAction by viewModel.selectedItemForAction.collectAsState()
@@ -195,6 +216,9 @@ class MainActivity : ComponentActivity() {
             val isAnalyzing by viewModel.isAnalyzing.collectAsState()
             val analysisProgress by viewModel.analysisProgress.collectAsState()
             val deviceProfile by viewModel.deviceProfile.collectAsState()
+
+            var driveAccountEmail by remember { mutableStateOf("rageshgr0805@gmail.com") }
+            var showSwitchAccountDialog by remember { mutableStateOf(false) }
 
             val snackbarHostState = remember { SnackbarHostState() }
 
@@ -254,13 +278,9 @@ class MainActivity : ComponentActivity() {
                                 serviceStatus = serviceStatus,
                                 resolution = selectedResolution,
                                 fps = selectedFps,
-                                bitrate = selectedBitrate,
                                 audioSource = selectedAudioSource,
-                                enableOverlay = enableOverlayTrigger,
-                                deviceProfile = deviceProfile,
-                                onResolutionSelected = { viewModel.setResolution(it) },
-                                onFpsSelected = { viewModel.setFps(it) },
-                                onBitrateSelected = { viewModel.setBitrate(it) },
+                                isBatteryOptIgnored = isBatteryOptIgnored,
+                                shortClipDurationSeconds = shortClipDurationSeconds,
                                 onAudioSourceSelected = { source ->
                                     if (source != ScreenRecordService.AUDIO_SOURCE_MUTE) {
                                         if (ContextCompat.checkSelfPermission(
@@ -274,20 +294,21 @@ class MainActivity : ComponentActivity() {
                                     }
                                     viewModel.setAudioSource(source)
                                 },
-                                onEnableOverlayToggled = { enable ->
-                                    if (enable && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this@MainActivity)) {
-                                        Toast.makeText(
-                                            this@MainActivity,
-                                            "Enable 'Display over other apps' to use the invisible corner stop trigger.",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                        val intent = Intent(
-                                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                            Uri.parse("package:$packageName")
-                                        )
-                                        startActivity(intent)
+                                onRequestIgnoreBatteryOpt = {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                        try {
+                                            val intent = Intent(
+                                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                                Uri.parse("package:$packageName")
+                                            )
+                                            batteryOptLauncher.launch(intent)
+                                        } catch (_: Exception) {
+                                            try {
+                                                val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                                                batteryOptLauncher.launch(intent)
+                                            } catch (_: Exception) {}
+                                        }
                                     }
-                                    viewModel.setEnableOverlayTrigger(enable)
                                 },
                                 onStartRecordClick = {
                                     val isRecording = serviceStatus.state == RecordingState.RECORDING ||
@@ -310,7 +331,11 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onPauseClick = { viewModel.pauseRecording(this@MainActivity) },
                                 onResumeClick = { viewModel.resumeRecording(this@MainActivity) },
-                                onRetuneDevice = { viewModel.runDeviceOptimization() }
+                                onTakeShortClipClick = {
+                                    viewModel.takeShortClip(this@MainActivity)
+                                    Toast.makeText(this@MainActivity, "Saving ${shortClipDurationSeconds}s short clip to ShortClips folder...", Toast.LENGTH_SHORT).show()
+                                },
+                                onGoToSettings = { viewModel.setTab(3) }
                             )
                             1 -> RecordingsTabScreen(
                                 recordings = recentRecordings,
@@ -328,6 +353,9 @@ class MainActivity : ComponentActivity() {
                                         Toast.makeText(this@MainActivity, "Could not share: ${e.message}", Toast.LENGTH_SHORT).show()
                                     }
                                 },
+                                onUploadToDriveClick = { item ->
+                                    uploadToGoogleDrive(this@MainActivity, item.uri, item.title, driveAccountEmail)
+                                },
                                 onDeleteClick = {
                                     viewModel.selectItemForAction(it)
                                     viewModel.confirmDelete(true)
@@ -335,6 +363,71 @@ class MainActivity : ComponentActivity() {
                                 onDeleteAllClick = {
                                     viewModel.confirmDeleteAll(true)
                                 }
+                            )
+                            2 -> DriveTabScreen(
+                                recordings = recentRecordings,
+                                driveAccountEmail = driveAccountEmail,
+                                onSwitchAccountClick = { showSwitchAccountDialog = true },
+                                onUploadClick = { item ->
+                                    uploadToGoogleDrive(this@MainActivity, item.uri, item.title, driveAccountEmail)
+                                },
+                                onUploadAllClick = {
+                                    val uris = ArrayList(recentRecordings.map { it.uri })
+                                    if (uris.isNotEmpty()) {
+                                        uploadMultipleToGoogleDrive(this@MainActivity, uris, driveAccountEmail)
+                                    } else {
+                                        Toast.makeText(this@MainActivity, "No recordings to upload", Toast.LENGTH_SHORT).show()
+                                    }
+                                },
+                                onOpenDriveAppClick = { openGoogleDriveApp(this@MainActivity) },
+                                onRefreshClick = { viewModel.refreshRecordings() }
+                            )
+                            3 -> SettingsTabScreen(
+                                deviceProfile = deviceProfile,
+                                resolution = selectedResolution,
+                                fps = selectedFps,
+                                bitrate = selectedBitrate,
+                                shortClipDurationSeconds = shortClipDurationSeconds,
+                                enableFloatingButton = isFloatingButtonEnabled,
+                                isBatteryOptIgnored = isBatteryOptIgnored,
+                                onResolutionSelected = { viewModel.setResolution(it) },
+                                onFpsSelected = { viewModel.setFps(it) },
+                                onBitrateSelected = { viewModel.setBitrate(it) },
+                                onShortClipDurationSelected = { seconds ->
+                                    viewModel.setShortClipDurationSeconds(seconds)
+                                },
+                                onEnableFloatingButtonToggled = { enable ->
+                                    if (enable && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this@MainActivity)) {
+                                        Toast.makeText(
+                                            this@MainActivity,
+                                            "Enable 'Display over other apps' to use side slider controls.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                        val intent = Intent(
+                                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                            Uri.parse("package:$packageName")
+                                        )
+                                        startActivity(intent)
+                                    }
+                                    viewModel.setFloatingButtonEnabled(enable)
+                                },
+                                onRequestIgnoreBatteryOpt = {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                        try {
+                                            val intent = Intent(
+                                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                                Uri.parse("package:$packageName")
+                                            )
+                                            batteryOptLauncher.launch(intent)
+                                        } catch (_: Exception) {
+                                            try {
+                                                val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                                                batteryOptLauncher.launch(intent)
+                                            } catch (_: Exception) {}
+                                        }
+                                    }
+                                },
+                                onRetuneDevice = { viewModel.runDeviceOptimization() }
                             )
                         }
 
@@ -407,6 +500,53 @@ class MainActivity : ComponentActivity() {
                         },
                         dismissButton = {
                             TextButton(onClick = { viewModel.confirmDeleteAll(false) }) {
+                                Text("Cancel")
+                            }
+                        }
+                    )
+                }
+
+                // Switch Google Drive Account Dialog
+                if (showSwitchAccountDialog) {
+                    var inputEmail by remember { mutableStateOf(driveAccountEmail) }
+                    AlertDialog(
+                        onDismissRequest = { showSwitchAccountDialog = false },
+                        title = { Text("Linked Google Drive Account", fontWeight = FontWeight.Bold) },
+                        text = {
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(
+                                    text = "Enter the Google account email where your screen recordings and game clips should be uploaded:",
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                androidx.compose.material3.OutlinedTextField(
+                                    value = inputEmail,
+                                    onValueChange = { inputEmail = it },
+                                    singleLine = true,
+                                    label = { Text("Google Account Email") },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("drive_email_input")
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            Button(
+                                onClick = {
+                                    if (inputEmail.isNotBlank()) {
+                                        driveAccountEmail = inputEmail.trim()
+                                    }
+                                    showSwitchAccountDialog = false
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.onSurface,
+                                    contentColor = MaterialTheme.colorScheme.surface
+                                )
+                            ) {
+                                Text("Connect Account")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showSwitchAccountDialog = false }) {
                                 Text("Cancel")
                             }
                         }
@@ -532,6 +672,45 @@ private fun GamingBottomNavigation(
                 unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
             )
         )
+
+        NavigationBarItem(
+            selected = currentTab == 2,
+            onClick = { onTabSelected(2) },
+            icon = {
+                Icon(
+                    painter = painterResource(id = R.drawable.ic_google_drive),
+                    contentDescription = "Drive Tab",
+                    modifier = Modifier.size(22.dp)
+                )
+            },
+            label = { Text("Drive", fontWeight = if (currentTab == 2) FontWeight.Bold else FontWeight.Normal) },
+            colors = NavigationBarItemDefaults.colors(
+                selectedIconColor = MaterialTheme.colorScheme.surface,
+                selectedTextColor = MaterialTheme.colorScheme.onSurface,
+                indicatorColor = MaterialTheme.colorScheme.onSurface,
+                unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        )
+
+        NavigationBarItem(
+            selected = currentTab == 3,
+            onClick = { onTabSelected(3) },
+            icon = {
+                Icon(
+                    imageVector = Icons.Filled.Settings,
+                    contentDescription = "Settings Tab"
+                )
+            },
+            label = { Text("Settings", fontWeight = if (currentTab == 3) FontWeight.Bold else FontWeight.Normal) },
+            colors = NavigationBarItemDefaults.colors(
+                selectedIconColor = MaterialTheme.colorScheme.surface,
+                selectedTextColor = MaterialTheme.colorScheme.onSurface,
+                indicatorColor = MaterialTheme.colorScheme.onSurface,
+                unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        )
     }
 }
 
@@ -540,19 +719,16 @@ private fun RecordTabScreen(
     serviceStatus: com.example.model.ServiceStatus,
     resolution: String,
     fps: Int,
-    bitrate: Int,
     audioSource: String,
-    enableOverlay: Boolean,
-    deviceProfile: com.example.model.DeviceProfile?,
-    onResolutionSelected: (String) -> Unit,
-    onFpsSelected: (Int) -> Unit,
-    onBitrateSelected: (Int) -> Unit,
+    isBatteryOptIgnored: Boolean,
+    shortClipDurationSeconds: Int,
     onAudioSourceSelected: (String) -> Unit,
-    onEnableOverlayToggled: (Boolean) -> Unit,
+    onRequestIgnoreBatteryOpt: () -> Unit,
     onStartRecordClick: () -> Unit,
     onPauseClick: () -> Unit,
     onResumeClick: () -> Unit,
-    onRetuneDevice: () -> Unit
+    onTakeShortClipClick: () -> Unit,
+    onGoToSettings: () -> Unit
 ) {
     val isRecording = serviceStatus.state == RecordingState.RECORDING
     val isPaused = serviceStatus.state == RecordingState.PAUSED
@@ -659,12 +835,545 @@ private fun RecordTabScreen(
                                     contentDescription = if (isPaused) "Resume" else "Pause"
                                 )
                             }
+
+                            Button(
+                                onClick = onTakeShortClipClick,
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                                ),
+                                modifier = Modifier
+                                    .height(56.dp)
+                                    .testTag("take_short_clip_button")
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        painter = painterResource(id = R.drawable.ic_overlay_clip),
+                                        contentDescription = "Take Short Clip",
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Text(
+                                        text = "${shortClipDurationSeconds}s Clip",
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp
+                                    )
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
+        // Best Recommended Setting Hint (Hardware Profile moved to Settings)
+        item {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = "Auto-detected best screen recording profile for your phone • ",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "Settings",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.clickable { onGoToSettings() }
+                )
+            }
+        }
+
+
+        // Audio Source Selection Card
+        item {
+            SettingCard(title = "Audio Source", icon = Icons.Filled.VolumeUp) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        SegmentButton(
+                            text = "Internal Game",
+                            icon = Icons.Filled.VolumeUp,
+                            selected = audioSource == ScreenRecordService.AUDIO_SOURCE_INTERNAL,
+                            onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_INTERNAL) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SegmentButton(
+                            text = "Microphone",
+                            icon = Icons.Filled.Mic,
+                            selected = audioSource == ScreenRecordService.AUDIO_SOURCE_MIC,
+                            onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_MIC) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        SegmentButton(
+                            text = "Game + Mic (Both)",
+                            icon = Icons.Filled.VolumeUp,
+                            selected = audioSource == ScreenRecordService.AUDIO_SOURCE_BOTH,
+                            onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_BOTH) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SegmentButton(
+                            text = "Mute",
+                            icon = Icons.Filled.VolumeOff,
+                            selected = audioSource == ScreenRecordService.AUDIO_SOURCE_MUTE,
+                            onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_MUTE) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+                Text(
+                    text = when (audioSource) {
+                        ScreenRecordService.AUDIO_SOURCE_INTERNAL -> "Captures game sound directly with zero background noise. Microphone is completely muted so your talking voice is NOT recorded."
+                        ScreenRecordService.AUDIO_SOURCE_MIC -> "Records microphone audio with voice commentary only. Internal game sound is not captured."
+                        ScreenRecordService.AUDIO_SOURCE_BOTH -> "Captures internal game sound AND your microphone voice commentary simultaneously."
+                        else -> "Video recorded with no sound."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        // Battery Optimization Warning (Fix 1:45 sudden stop on Realme / Xiaomi / Oppo)
+        if (!isBatteryOptIgnored) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.BatteryAlert,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp),
+                                    tint = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = "Prevent Recording Auto-Stop",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Certain phones (Realme, Xiaomi, Oppo) terminate screen recording after ~1.45 minutes. Exclude from battery restrictions for uninterrupted recording.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Button(
+                            onClick = onRequestIgnoreBatteryOpt,
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.onSurface,
+                                contentColor = MaterialTheme.colorScheme.surface
+                            ),
+                            modifier = Modifier.testTag("fix_battery_optimization_button")
+                        ) {
+                            Text("Fix Now", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DriveTabScreen(
+    recordings: List<RecordingItem>,
+    driveAccountEmail: String,
+    onSwitchAccountClick: () -> Unit,
+    onUploadClick: (RecordingItem) -> Unit,
+    onUploadAllClick: () -> Unit,
+    onOpenDriveAppClick: () -> Unit,
+    onRefreshClick: () -> Unit
+) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)
+    ) {
+        // Linked Google Drive Account Card
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(42.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF4285F4)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "G",
+                                color = Color.White,
+                                fontWeight = FontWeight.Black,
+                                fontSize = 20.sp
+                            )
+                        }
+                        Column {
+                            Text(
+                                text = "Linked Google Drive",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = driveAccountEmail,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    OutlinedButton(
+                        onClick = onSwitchAccountClick,
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.testTag("switch_drive_account_button")
+                    ) {
+                        Text("Switch", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+
+        // Hero Card
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(MaterialTheme.colorScheme.surface)
+                                .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(12.dp)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                painter = painterResource(id = R.drawable.ic_google_drive),
+                                contentDescription = "Google Drive",
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Google Drive Cloud Hub",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Upload recordings and game clips directly to $driveAccountEmail storage.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = onOpenDriveAppClick,
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(46.dp)
+                                .testTag("open_drive_app_button")
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    painter = painterResource(id = R.drawable.ic_google_drive),
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text("Open Drive", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        Button(
+                            onClick = onUploadAllClick,
+                            shape = RoundedCornerShape(10.dp),
+                            enabled = recordings.isNotEmpty(),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.onSurface,
+                                contentColor = MaterialTheme.colorScheme.surface
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(46.dp)
+                                .testTag("upload_all_to_drive_button")
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Share,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text("Upload All (${recordings.size})", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Section Title & Refresh
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "Videos Ready for Backup (${recordings.size})",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                IconButton(
+                    onClick = onRefreshClick,
+                    modifier = Modifier.testTag("refresh_drive_list_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Refresh,
+                        contentDescription = "Refresh Videos",
+                        tint = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+        }
+
+        if (recordings.isEmpty()) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_google_drive),
+                            contentDescription = null,
+                            modifier = Modifier.size(48.dp)
+                        )
+                        Text(
+                            text = "No recordings found to upload",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "Record your screen first, then return here to upload your footage directly to Google Drive.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
+            }
+        } else {
+            items(recordings, key = { "drive_${it.id}" }) { item ->
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(12.dp))
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(width = 84.dp, height = 56.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surface)
+                        ) {
+                            VideoThumbnail(
+                                uri = item.uri,
+                                contentDescription = item.title,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(12.dp))
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                if (item.isClip) {
+                                    Surface(
+                                        shape = RoundedCornerShape(4.dp),
+                                        color = MaterialTheme.colorScheme.primaryContainer,
+                                        modifier = Modifier.padding(bottom = 2.dp)
+                                    ) {
+                                        Text(
+                                            text = "CLIP",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            fontSize = 8.sp,
+                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = item.title,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Text(
+                                text = "${item.formattedDuration} • ${item.formattedSize}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        Button(
+                            onClick = { onUploadClick(item) },
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.onSurface,
+                                contentColor = MaterialTheme.colorScheme.surface
+                            ),
+                            modifier = Modifier.testTag("upload_item_drive_button_${item.id}")
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    painter = painterResource(id = R.drawable.ic_google_drive),
+                                    contentDescription = null,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text("Upload", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsTabScreen(
+    deviceProfile: com.example.model.DeviceProfile?,
+    resolution: String,
+    fps: Int,
+    bitrate: Int,
+    shortClipDurationSeconds: Int,
+    enableFloatingButton: Boolean,
+    isBatteryOptIgnored: Boolean,
+    onResolutionSelected: (String) -> Unit,
+    onFpsSelected: (Int) -> Unit,
+    onBitrateSelected: (Int) -> Unit,
+    onShortClipDurationSelected: (Int) -> Unit,
+    onEnableFloatingButtonToggled: (Boolean) -> Unit,
+    onRequestIgnoreBatteryOpt: () -> Unit,
+    onRetuneDevice: () -> Unit
+) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)
+    ) {
         // Hardware Device Tuning Card
         item {
             Card(
@@ -719,47 +1428,6 @@ private fun RecordTabScreen(
                         Text("Re-scan", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     }
                 }
-            }
-        }
-
-        // Audio Source Selection Card
-        item {
-            SettingCard(title = "Audio Source", icon = Icons.Filled.VolumeUp) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    SegmentButton(
-                        text = "Internal Game",
-                        icon = Icons.Filled.VolumeUp,
-                        selected = audioSource == ScreenRecordService.AUDIO_SOURCE_INTERNAL,
-                        onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_INTERNAL) },
-                        modifier = Modifier.weight(1f)
-                    )
-                    SegmentButton(
-                        text = "Microphone",
-                        icon = Icons.Filled.Mic,
-                        selected = audioSource == ScreenRecordService.AUDIO_SOURCE_MIC,
-                        onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_MIC) },
-                        modifier = Modifier.weight(1f)
-                    )
-                    SegmentButton(
-                        text = "Mute",
-                        icon = Icons.Filled.VolumeOff,
-                        selected = audioSource == ScreenRecordService.AUDIO_SOURCE_MUTE,
-                        onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_MUTE) },
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-                Text(
-                    text = when (audioSource) {
-                        ScreenRecordService.AUDIO_SOURCE_INTERNAL -> "Captures game sound directly with zero background noise."
-                        ScreenRecordService.AUDIO_SOURCE_MIC -> "Records microphone audio with voice commentary."
-                        else -> "Video recorded with no sound."
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
             }
         }
 
@@ -838,7 +1506,47 @@ private fun RecordTabScreen(
             }
         }
 
-        // Invisible Overlay Stop Trigger Card
+        // Short Clip Duration Setting Card
+        item {
+            SettingCard(title = "Short Clip Duration", icon = Icons.Filled.VideoLibrary) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    SegmentButton(
+                        text = "15 Sec",
+                        selected = shortClipDurationSeconds == 15,
+                        onClick = { onShortClipDurationSelected(15) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    SegmentButton(
+                        text = "30 Sec (Default)",
+                        selected = shortClipDurationSeconds == 30,
+                        onClick = { onShortClipDurationSelected(30) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    SegmentButton(
+                        text = "60 Sec",
+                        selected = shortClipDurationSeconds == 60,
+                        onClick = { onShortClipDurationSelected(60) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    SegmentButton(
+                        text = "2 Min",
+                        selected = shortClipDurationSeconds == 120,
+                        onClick = { onShortClipDurationSelected(120) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Text(
+                    text = "When you press the Short Clip button during a recording, the last $shortClipDurationSeconds seconds of footage will be extracted into a separate video and saved into the dedicated ShortClips folder.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        // Edge Side Slider Controls Card (replaces floating button)
         item {
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -855,28 +1563,117 @@ private fun RecordTabScreen(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Widgets,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp),
+                                tint = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Side Slider Edge Controls",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "Invisible Corner Stop Trigger",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = "Places an invisible 0-alpha tap target in the top-right corner to stop recording without opening notification shade.",
+                            text = "Rests flush on the screen edge as an elegant slider handle. Tapping slides out Pause, Stop & Save, and Short Clip controls over any game or app.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                     Spacer(modifier = Modifier.width(12.dp))
                     Switch(
-                        checked = enableOverlay,
-                        onCheckedChange = onEnableOverlayToggled,
+                        checked = enableFloatingButton,
+                        onCheckedChange = onEnableFloatingButtonToggled,
                         colors = SwitchDefaults.colors(
                             checkedThumbColor = MaterialTheme.colorScheme.surface,
                             checkedTrackColor = MaterialTheme.colorScheme.onSurface
                         ),
-                        modifier = Modifier.testTag("overlay_trigger_switch")
+                        modifier = Modifier.testTag("side_slider_controls_switch")
                     )
+                }
+            }
+        }
+
+        // Battery Optimization Setting
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.BatteryAlert,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp),
+                                tint = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Battery Optimization Protection",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = if (isBatteryOptIgnored) {
+                                "Active. App is exempt from battery saver restrictions, preventing sudden 1:45 minute terminations."
+                            } else {
+                                "Not configured. Some phone brands (Realme/Xiaomi/Oppo) terminate recordings after ~1.45 minutes."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    if (!isBatteryOptIgnored) {
+                        Button(
+                            onClick = onRequestIgnoreBatteryOpt,
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.onSurface,
+                                contentColor = MaterialTheme.colorScheme.surface
+                            ),
+                            modifier = Modifier.testTag("settings_battery_opt_button")
+                        ) {
+                            Text("Fix Now", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    } else {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.surface,
+                            modifier = Modifier.border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                        ) {
+                            Text(
+                                text = "Protected",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -1051,6 +1848,7 @@ private fun RecordingsTabScreen(
     onRefreshClick: () -> Unit,
     onPlayClick: (RecordingItem) -> Unit,
     onShareClick: (RecordingItem) -> Unit,
+    onUploadToDriveClick: (RecordingItem) -> Unit,
     onDeleteClick: (RecordingItem) -> Unit,
     onDeleteAllClick: () -> Unit
 ) {
@@ -1151,6 +1949,7 @@ private fun RecordingsTabScreen(
                         item = item,
                         onPlayClick = { onPlayClick(item) },
                         onShareClick = { onShareClick(item) },
+                        onUploadToDriveClick = { onUploadToDriveClick(item) },
                         onDeleteClick = { onDeleteClick(item) }
                     )
                 }
@@ -1164,14 +1963,15 @@ private fun RecordingCard(
     item: RecordingItem,
     onPlayClick: () -> Unit,
     onShareClick: () -> Unit,
+    onUploadToDriveClick: () -> Unit,
     onDeleteClick: () -> Unit
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-        shape = RoundedCornerShape(12.dp),
+        shape = RoundedCornerShape(14.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(12.dp))
+            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(14.dp))
     ) {
         Row(
             modifier = Modifier
@@ -1179,18 +1979,35 @@ private fun RecordingCard(
                 .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Thumbnail with duration badge
+            // Column 1 (Left - merged across both rows): Thumbnail with duration badge and play icon
             Box(
                 modifier = Modifier
-                    .size(width = 96.dp, height = 64.dp)
+                    .size(width = 100.dp, height = 74.dp)
                     .clip(RoundedCornerShape(8.dp))
                     .background(MaterialTheme.colorScheme.surface)
+                    .clickable { onPlayClick() }
             ) {
                 VideoThumbnail(
                     uri = item.uri,
                     contentDescription = item.title,
                     modifier = Modifier.fillMaxSize()
                 )
+
+                // Play icon overlay
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(28.dp)
+                        .background(Color.Black.copy(alpha = 0.5f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.PlayArrow,
+                        contentDescription = "Play",
+                        tint = Color.White,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
 
                 Box(
                     modifier = Modifier
@@ -1210,55 +2027,108 @@ private fun RecordingCard(
 
             Spacer(modifier = Modifier.width(12.dp))
 
-            // Information
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = item.title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = "${item.formattedSize} • ${item.formattedDate}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-
-            // Action Buttons
-            IconButton(
-                onClick = onPlayClick,
-                modifier = Modifier.testTag("play_video_button_${item.id}")
+            // Column 2 (Right): Two distinct rows
+            // Row 1 (Upper Part): Name of the video, clip badge, size and date
+            // Row 2 (Lower Part): Play button, Drive button, Share button, Delete button
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Filled.PlayArrow,
-                    contentDescription = "Play Video",
-                    tint = MaterialTheme.colorScheme.onSurface
-                )
-            }
+                // ROW 1: Name of the video & metadata
+                Column {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (item.isClip) {
+                            Surface(
+                                shape = RoundedCornerShape(4.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer
+                            ) {
+                                Text(
+                                    text = "CLIP",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    fontSize = 8.sp,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                        Text(
+                            text = item.title,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Text(
+                        text = "${item.formattedSize} • ${item.formattedDate}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
 
-            IconButton(
-                onClick = onShareClick,
-                modifier = Modifier.testTag("share_video_button_${item.id}")
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.Share,
-                    contentDescription = "Share Video",
-                    tint = MaterialTheme.colorScheme.onSurface
-                )
-            }
+                // ROW 2: Action buttons (Play, Drive, Share, Delete)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = onPlayClick,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .testTag("play_video_button_${item.id}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.PlayArrow,
+                            contentDescription = "Play Video",
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
 
-            IconButton(
-                onClick = onDeleteClick,
-                modifier = Modifier.testTag("delete_video_button_${item.id}")
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.Delete,
-                    contentDescription = "Delete Video",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                    IconButton(
+                        onClick = onUploadToDriveClick,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .testTag("upload_drive_button_${item.id}")
+                    ) {
+                        Icon(
+                            painter = painterResource(id = R.drawable.ic_google_drive),
+                            contentDescription = "Upload to Google Drive",
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    IconButton(
+                        onClick = onShareClick,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .testTag("share_video_button_${item.id}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Share,
+                            contentDescription = "Share Video",
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+
+                    IconButton(
+                        onClick = onDeleteClick,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .testTag("delete_video_button_${item.id}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Delete,
+                            contentDescription = "Delete Video",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
         }
     }
@@ -1325,3 +2195,81 @@ private fun InAppVideoPlayerDialog(
         }
     }
 }
+
+private fun uploadToGoogleDrive(context: Context, uri: Uri, title: String, accountEmail: String = "rageshgr0805@gmail.com") {
+    try {
+        Toast.makeText(context, "Opening Google Drive ($accountEmail)...", Toast.LENGTH_SHORT).show()
+        val driveIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "video/mp4"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_SUBJECT, title)
+            putExtra("account_name", accountEmail)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            setPackage("com.google.android.apps.docs")
+        }
+        val resolveInfos = context.packageManager.queryIntentActivities(driveIntent, PackageManager.MATCH_DEFAULT_ONLY)
+        if (resolveInfos.isNotEmpty()) {
+            context.startActivity(driveIntent)
+        } else {
+            val chooser = Intent.createChooser(
+                Intent(Intent.ACTION_SEND).apply {
+                    type = "video/mp4"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_SUBJECT, title)
+                    putExtra("account_name", accountEmail)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                },
+                "Upload to Google Drive ($accountEmail)"
+            )
+            context.startActivity(chooser)
+        }
+    } catch (e: Exception) {
+        Toast.makeText(context, "Could not open Google Drive: ${e.message}", Toast.LENGTH_SHORT).show()
+    }
+}
+
+private fun uploadMultipleToGoogleDrive(context: Context, uris: ArrayList<Uri>, accountEmail: String = "rageshgr0805@gmail.com") {
+    try {
+        Toast.makeText(context, "Uploading ${uris.size} videos to Google Drive ($accountEmail)...", Toast.LENGTH_SHORT).show()
+        val driveIntent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+            type = "video/*"
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+            putExtra("account_name", accountEmail)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            setPackage("com.google.android.apps.docs")
+        }
+        val resolveInfos = context.packageManager.queryIntentActivities(driveIntent, PackageManager.MATCH_DEFAULT_ONLY)
+        if (resolveInfos.isNotEmpty()) {
+            context.startActivity(driveIntent)
+        } else {
+            val chooser = Intent.createChooser(
+                Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                    type = "video/*"
+                    putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                    putExtra("account_name", accountEmail)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                },
+                "Upload All to Google Drive ($accountEmail)"
+            )
+            context.startActivity(chooser)
+        }
+    } catch (e: Exception) {
+        Toast.makeText(context, "Could not upload to Google Drive: ${e.message}", Toast.LENGTH_SHORT).show()
+    }
+}
+
+private fun openGoogleDriveApp(context: Context) {
+    try {
+        val intent = context.packageManager.getLaunchIntentForPackage("com.google.android.apps.docs")
+        if (intent != null) {
+            context.startActivity(intent)
+        } else {
+            val webIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://drive.google.com"))
+            context.startActivity(webIntent)
+        }
+    } catch (e: Exception) {
+        Toast.makeText(context, "Could not open Google Drive: ${e.message}", Toast.LENGTH_SHORT).show()
+    }
+}
+
+

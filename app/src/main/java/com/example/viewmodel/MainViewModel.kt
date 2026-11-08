@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.util.DisplayMetrics
+import android.util.Log
 import android.view.WindowManager
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
@@ -21,8 +22,10 @@ import com.example.repository.VideoRepository
 import com.example.service.ScreenCaptureService
 import com.example.service.ScreenRecordService
 import com.example.system.DndManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -61,6 +64,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val selectedAudioSource: StateFlow<String> = dataStore.selectedAudioSource
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "INTERNAL")
 
+    val selectedOrientation: StateFlow<String> = dataStore.selectedOrientation
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "LANDSCAPE")
+
     val enableOverlayTrigger: StateFlow<Boolean> = dataStore.enableOverlayTrigger
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
@@ -75,6 +81,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val isFloatingButtonEnabled: StateFlow<Boolean> = dataStore.isFloatingButtonEnabled
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+
+    val shortClipDurationSeconds: StateFlow<Int> = dataStore.shortClipDurationSeconds
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 30)
 
     val isGameVoiceChatEnabled: StateFlow<Boolean> = dataStore.isGameVoiceChatEnabled
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
@@ -197,6 +206,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setAudioSource(source: String) {
         viewModelScope.launch {
             dataStore.setSelectedAudioSource(source)
+        }
+    }
+
+    fun setOrientation(orientation: String) {
+        viewModelScope.launch {
+            dataStore.setSelectedOrientation(orientation)
+        }
+    }
+
+    fun setFloatingButtonEnabled(enable: Boolean) {
+        viewModelScope.launch {
+            dataStore.setFloatingButtonEnabled(enable)
         }
     }
 
@@ -396,19 +417,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteRecording(item: RecordingItem) {
-        viewModelScope.launch {
-            val success = videoRepository.deleteVideo(item.uri)
-            if (success) {
-                if (_activePlayingItem.value?.id == item.id) {
-                    _activePlayingItem.value = null
+        // 1. Instant optimistic UI update: dismiss dialogs and remove item immediately with ZERO lag
+        if (_activePlayingItem.value?.id == item.id) _activePlayingItem.value = null
+        if (_newlySavedRecording.value?.id == item.id) _newlySavedRecording.value = null
+        _selectedItemForAction.value = null
+        _showDeleteConfirmation.value = false
+        _recentRecordings.value = _recentRecordings.value.filter { it.id != item.id }
+
+        // 2. Perform file deletion and MediaStore cleanup on IO thread
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                videoRepository.deleteVideo(item.uri)
+                val updated = videoRepository.getRecordedVideos()
+                withContext(Dispatchers.Main) {
+                    _recentRecordings.value = updated
+                    _uiEvents.emit("Recording deleted.")
                 }
-                if (_newlySavedRecording.value?.id == item.id) {
-                    _newlySavedRecording.value = null
-                }
-                _selectedItemForAction.value = null
-                _showDeleteConfirmation.value = false
-                refreshRecordings()
-                _uiEvents.emit("Recording deleted.")
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Error deleting recording: ${e.message}")
             }
         }
     }
@@ -418,18 +444,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteAllRecordings() {
-        viewModelScope.launch {
-            val count = videoRepository.deleteAllVideos()
-            _activePlayingItem.value = null
-            _newlySavedRecording.value = null
-            _selectedItemForAction.value = null
-            _showDeleteConfirmation.value = false
-            _showDeleteAllConfirmation.value = false
-            refreshRecordings()
-            if (count > 0) {
-                _uiEvents.emit("Deleted $count recordings.")
-            } else {
-                _uiEvents.emit("No recordings to delete.")
+        // 1. Instant optimistic UI update
+        _activePlayingItem.value = null
+        _newlySavedRecording.value = null
+        _selectedItemForAction.value = null
+        _showDeleteConfirmation.value = false
+        _showDeleteAllConfirmation.value = false
+        _recentRecordings.value = emptyList()
+
+        // 2. Background cleanup
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val count = videoRepository.deleteAllVideos()
+                val updated = videoRepository.getRecordedVideos()
+                withContext(Dispatchers.Main) {
+                    _recentRecordings.value = updated
+                    if (count > 0) {
+                        _uiEvents.emit("Deleted $count recording(s).")
+                    } else {
+                        _uiEvents.emit("No recordings to delete.")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Error deleting all recordings: ${e.message}")
             }
         }
     }
@@ -472,21 +509,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val data = pendingProjectionData ?: return
         val context = getApplication<Application>().applicationContext
 
-        // Determine resolution with strict 16-aligned dimensions
+        // Determine orientation and 16-aligned dimensions
+        val orientationPref = selectedOrientation.value
         val is1080p = selectedResolution.value == "1080p"
-        val isPortrait = context.resources.configuration.orientation != android.content.res.Configuration.ORIENTATION_LANDSCAPE
-        val width = if (is1080p) (if (isPortrait) 1080 else 1920) else (if (isPortrait) 720 else 1280)
-        val height = if (is1080p) (if (isPortrait) 1920 else 1080) else (if (isPortrait) 1280 else 720)
-        val fps = selectedFps.value
-        val bitrate = selectedBitrate.value
-        val audioSource = selectedAudioSource.value
-        val overlayTrigger = enableOverlayTrigger.value
-
         val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         wm.defaultDisplay.getRealMetrics(metrics)
         val dpi = metrics.densityDpi
+
+        @Suppress("DEPRECATION")
+        val rotation = wm.defaultDisplay.rotation
+        val isDeviceCurrentlyLandscape = rotation == android.view.Surface.ROTATION_90 || rotation == android.view.Surface.ROTATION_270
+        val isScreenWiderThanTall = metrics.widthPixels > metrics.heightPixels
+
+        val recordLandscape = when (orientationPref) {
+            "LANDSCAPE" -> true
+            "PORTRAIT" -> false
+            else -> isDeviceCurrentlyLandscape || isScreenWiderThanTall
+        }
+
+        val width = if (is1080p) (if (recordLandscape) 1920 else 1080) else (if (recordLandscape) 1280 else 720)
+        val height = if (is1080p) (if (recordLandscape) 1080 else 1920) else (if (recordLandscape) 720 else 1280)
+        val fps = selectedFps.value
+        val bitrate = selectedBitrate.value
+        val audioSource = selectedAudioSource.value
+        val overlayTrigger = enableOverlayTrigger.value
+        val floatingBtn = isFloatingButtonEnabled.value
 
         val intent = Intent(context, ScreenRecordService::class.java).apply {
             action = ScreenRecordService.ACTION_START
@@ -499,12 +548,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             putExtra(ScreenRecordService.EXTRA_BITRATE, bitrate)
             putExtra(ScreenRecordService.EXTRA_AUDIO_SOURCE, audioSource)
             putExtra(ScreenRecordService.EXTRA_ENABLE_OVERLAY, overlayTrigger)
+            putExtra(ScreenRecordService.EXTRA_ORIENTATION, orientationPref)
+            putExtra(ScreenRecordService.EXTRA_ENABLE_FLOATING, floatingBtn)
+            putExtra(ScreenRecordService.EXTRA_SHORT_CLIP_SECONDS, shortClipDurationSeconds.value)
         }
 
         ContextCompat.startForegroundService(context, intent)
 
         pendingProjectionResultCode = null
         pendingProjectionData = null
+    }
+
+    fun setShortClipDurationSeconds(seconds: Int) {
+        viewModelScope.launch {
+            dataStore.setShortClipDurationSeconds(seconds)
+        }
+    }
+
+    fun takeShortClip(context: Context) {
+        val intent = Intent(context, ScreenRecordService::class.java).apply {
+            action = ScreenRecordService.ACTION_SHORT_CLIP
+        }
+        context.startService(intent)
     }
 
     fun pauseRecording(context: Context) {
