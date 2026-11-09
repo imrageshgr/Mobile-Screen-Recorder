@@ -45,12 +45,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val dataStore = ProfileDataStore(application.applicationContext)
     private val analyzer = DeviceAnalyzer(application.applicationContext)
     val dndManager = DndManager(application.applicationContext)
+    val thermalMonitor = com.example.system.ThermalChargingMonitor(application.applicationContext)
+    val thermalStatus: StateFlow<com.example.system.ThermalStatusInfo> = thermalMonitor.statusFlow
 
     // ScreenRecordService status is the single source of truth for recording and hardware diagnostics
     val serviceStatus: StateFlow<ServiceStatus> = ScreenRecordService.serviceStatus
 
     val isDarkTheme: StateFlow<Boolean> = dataStore.isDarkTheme
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+
+    val themeMode: StateFlow<String> = dataStore.themeMode
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "SYSTEM")
+
+    val driveAccountEmail: StateFlow<String> = dataStore.driveAccountEmail
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "")
+
+    val liveStreamConfig: StateFlow<com.example.model.LiveStreamConfig> = dataStore.liveStreamConfig
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), com.example.model.LiveStreamConfig())
+
+    val liveStreamHistory: StateFlow<List<com.example.model.LiveStreamHistoryItem>> = dataStore.liveStreamHistory
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val selectedResolution: StateFlow<String> = dataStore.selectedResolution
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "1080p")
@@ -158,6 +172,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _showAboutDialog = MutableStateFlow(false)
     val showAboutDialog: StateFlow<Boolean> = _showAboutDialog.asStateFlow()
 
+    private val _showOverheatStopPrompt = MutableStateFlow(false)
+    val showOverheatStopPrompt: StateFlow<Boolean> = _showOverheatStopPrompt.asStateFlow()
+    private var hasUserDismissedOverheatForCurrentSession = false
+
     private val _uiEvents = MutableSharedFlow<String>()
     val uiEvents: SharedFlow<String> = _uiEvents.asSharedFlow()
 
@@ -169,6 +187,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         loadProfileAndInitialize()
         refreshRecordings()
         observeServiceSavedRecordings()
+        thermalMonitor.startMonitoring()
+        observeThermalAlerts()
     }
 
     fun setTab(index: Int) {
@@ -178,10 +198,91 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun toggleTheme() {
+    fun toggleTheme(isCurrentlyDark: Boolean? = null) {
         viewModelScope.launch {
-            val newTheme = !isDarkTheme.value
-            dataStore.setDarkTheme(newTheme)
+            val dark = isCurrentlyDark ?: isDarkTheme.value
+            val nextMode = if (dark) "LIGHT" else "DARK"
+            dataStore.setThemeMode(nextMode)
+            dataStore.setDarkTheme(!dark)
+        }
+    }
+
+    fun setThemeMode(mode: String) {
+        viewModelScope.launch {
+            dataStore.setThemeMode(mode)
+            when (mode) {
+                "DARK" -> dataStore.setDarkTheme(true)
+                "LIGHT" -> dataStore.setDarkTheme(false)
+            }
+        }
+    }
+
+    fun setDriveAccountEmail(email: String) {
+        viewModelScope.launch {
+            dataStore.setDriveAccountEmail(email.trim())
+        }
+    }
+
+    fun updateLiveStreamConfig(config: com.example.model.LiveStreamConfig) {
+        viewModelScope.launch {
+            dataStore.saveLiveStreamConfig(config)
+        }
+    }
+
+    fun updateStreamPlatform(platform: String) {
+        viewModelScope.launch {
+            val current = liveStreamConfig.value
+            val defaultUrl = com.example.model.LiveStreamConfig.getDefaultUrlForPlatform(platform)
+            dataStore.saveLiveStreamConfig(current.copy(platform = platform, streamUrl = defaultUrl))
+        }
+    }
+
+    fun updateStreamCredentials(url: String, key: String, title: String) {
+        viewModelScope.launch {
+            val current = liveStreamConfig.value
+            dataStore.saveLiveStreamConfig(current.copy(streamUrl = url.trim(), streamKey = key.trim(), streamTitle = title.trim()))
+        }
+    }
+
+    fun updateStreamOrientation(orientation: String) {
+        viewModelScope.launch {
+            val current = liveStreamConfig.value
+            dataStore.saveLiveStreamConfig(current.copy(orientation = orientation))
+        }
+    }
+
+    fun toggleLayoutEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            val current = liveStreamConfig.value
+            dataStore.saveLiveStreamConfig(current.copy(isLayoutEnabled = enabled))
+        }
+    }
+
+    fun recordLiveStreamSession(resolution: String, fps: Int, bitrate: Int) {
+        viewModelScope.launch {
+            val config = liveStreamConfig.value
+            val platformLabel = when (config.platform) {
+                com.example.model.LiveStreamConfig.PLATFORM_YOUTUBE -> "YouTube Live"
+                com.example.model.LiveStreamConfig.PLATFORM_TWITCH -> "Twitch"
+                com.example.model.LiveStreamConfig.PLATFORM_FACEBOOK -> "Facebook Gaming"
+                com.example.model.LiveStreamConfig.PLATFORM_INSTAGRAM -> "Instagram Live"
+                else -> "Custom RTMP"
+            }
+            val orientationLabel = if (config.orientation == "HORIZONTAL") "16:9 Landscape" else "9:16 Vertical"
+            val dateFormat = java.text.SimpleDateFormat("MMM dd, yyyy • hh:mm a", java.util.Locale.getDefault())
+            val dateStr = dateFormat.format(java.util.Date())
+
+            val historyItem = com.example.model.LiveStreamHistoryItem(
+                platform = platformLabel,
+                streamTitle = if (config.streamTitle.isNotBlank()) config.streamTitle else "Mobile Game Live Broadcast",
+                dateFormatted = dateStr,
+                resolution = resolution,
+                fps = fps,
+                bitrateMbps = bitrate / 1_000_000,
+                orientation = orientationLabel,
+                streamServer = config.streamUrl.substringBefore("?").take(45)
+            )
+            dataStore.addLiveStreamHistoryItem(historyItem)
         }
     }
 
@@ -591,5 +692,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             action = ScreenRecordService.ACTION_STOP
         }
         context.startService(intent)
+    }
+
+    private fun observeThermalAlerts() {
+        viewModelScope.launch {
+            combine(thermalStatus, serviceStatus) { thermal, status ->
+                thermal to status
+            }.collect { (thermal, status) ->
+                val isActivelyRecording = status.state == RecordingState.RECORDING || status.state == RecordingState.PAUSED
+                if (!isActivelyRecording) {
+                    hasUserDismissedOverheatForCurrentSession = false
+                    _showOverheatStopPrompt.value = false
+                } else if (thermal.isCriticalHeat && !hasUserDismissedOverheatForCurrentSession) {
+                    _showOverheatStopPrompt.value = true
+                }
+            }
+        }
+    }
+
+    fun acceptOverheatStop(context: Context) {
+        _showOverheatStopPrompt.value = false
+        stopRecording(context)
+    }
+
+    fun declineOverheatStop() {
+        _showOverheatStopPrompt.value = false
+        hasUserDismissedOverheatForCurrentSession = true
+    }
+
+    fun dismissOverheatPrompt() {
+        declineOverheatStop()
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        try {
+            thermalMonitor.stopMonitoring()
+        } catch (_: Exception) {}
     }
 }

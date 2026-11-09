@@ -45,6 +45,7 @@ import com.example.R
  */
 class FloatingControlOverlay(
     private val context: Context,
+    private val shortClipDurationSeconds: Int = 30,
     private val onPauseClick: () -> Unit = {},
     private val onResumeClick: () -> Unit = {},
     private val onStopClick: () -> Unit = {},
@@ -59,6 +60,7 @@ class FloatingControlOverlay(
         onPauseResumeClick: () -> Unit
     ) : this(
         context = context,
+        shortClipDurationSeconds = 30,
         onPauseClick = onPauseResumeClick,
         onResumeClick = onPauseResumeClick,
         onStopClick = onStopClick,
@@ -178,6 +180,20 @@ class FloatingControlOverlay(
             shortClipBtn?.animate()?.scaleX(1.3f)?.scaleY(1.3f)?.setDuration(150)?.withEndAction {
                 shortClipBtn?.animate()?.scaleX(1.0f)?.scaleY(1.0f)?.setDuration(150)?.start()
             }?.start()
+        }
+    }
+
+    fun updateThermalAlert(tempCelsius: Float, isOverheating: Boolean, isCritical: Boolean) {
+        mainHandler.post {
+            if (!isSaving && isAttached) {
+                if (isCritical) {
+                    val tempStr = String.format(java.util.Locale.US, "%.0f°C", tempCelsius)
+                    expandedTimerText?.text = "🔥 $tempStr • Overheating"
+                } else if (isOverheating) {
+                    val tempStr = String.format(java.util.Locale.US, "%.0f°C", tempCelsius)
+                    expandedTimerText?.text = "⚡ $tempStr • High Heat"
+                }
+            }
         }
     }
 
@@ -330,18 +346,42 @@ class FloatingControlOverlay(
             }
             addView(stopSaveBtn)
 
-            // BUTTON 3: Short Clip Button (Golden highlight icon)
-            shortClipBtn = createSliderButton(
-                iconRes = R.drawable.ic_overlay_clip,
-                tintColor = Color.parseColor("#FFD60A"),
-                bgColor = Color.parseColor("#2C2A1E"),
-                contentDesc = "Take Short Clip"
-            ) {
-                if (isSaving) return@createSliderButton
-                onShortClipClick()
-                resetAutoCollapseTimer()
+            // BUTTON 3: Short Clip Button (Golden highlight icon + duration badge)
+            val clipContainer = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                val padH = dp(6)
+                val padV = dp(3)
+                setPadding(padH, padV, padH, padV)
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(14).toFloat()
+                    setColor(Color.parseColor("#2C2A1E"))
+                    setStroke(dp(1), Color.parseColor("#80FFD60A"))
+                }
+                val icon = ImageView(context).apply {
+                    layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
+                    setImageResource(R.drawable.ic_overlay_clip)
+                    setColorFilter(Color.parseColor("#FFD60A"))
+                    contentDescription = "Take ${shortClipDurationSeconds}s Short Clip"
+                }
+                shortClipBtn = icon
+                val label = TextView(context).apply {
+                    text = "${shortClipDurationSeconds}s"
+                    setTextColor(Color.parseColor("#FFD60A"))
+                    textSize = 9f
+                    typeface = Typeface.DEFAULT_BOLD
+                }
+                addView(icon)
+                addView(label)
+                setOnClickListener {
+                    if (isSaving) return@setOnClickListener
+                    wakeFromDock()
+                    onShortClipClick()
+                    resetAutoCollapseTimer()
+                }
             }
-            addView(shortClipBtn)
+            addView(clipContainer)
 
             // BUTTON 4: Slide back chevron (›)
             collapseChevron = TextView(context).apply {

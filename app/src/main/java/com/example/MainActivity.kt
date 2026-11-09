@@ -14,12 +14,15 @@ import android.widget.MediaController
 import android.widget.Toast
 import android.widget.VideoView
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -125,6 +128,7 @@ import com.example.ui.theme.LightBorderGray
 import com.example.ui.theme.LightSurface
 import com.example.ui.theme.PureBlack
 import com.example.ui.theme.PureWhite
+import com.example.ui.screens.LiveTabScreen
 import com.example.ui.theme.ScreenCapTheme
 import com.example.viewmodel.MainViewModel
 
@@ -186,7 +190,30 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            val isDarkTheme by viewModel.isDarkTheme.collectAsState()
+            val themeMode by viewModel.themeMode.collectAsState()
+            val systemInDarkTheme = isSystemInDarkTheme()
+            val isDarkTheme = when (themeMode) {
+                "DARK" -> true
+                "LIGHT" -> false
+                else -> systemInDarkTheme
+            }
+
+            DisposableEffect(isDarkTheme) {
+                enableEdgeToEdge(
+                    statusBarStyle = if (isDarkTheme) {
+                        SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                    } else {
+                        SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+                    },
+                    navigationBarStyle = if (isDarkTheme) {
+                        SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+                    } else {
+                        SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
+                    }
+                )
+                onDispose { }
+            }
+
             val currentTab by viewModel.currentTab.collectAsState()
             val serviceStatus by viewModel.serviceStatus.collectAsState()
             val recentRecordings by viewModel.recentRecordings.collectAsState()
@@ -217,8 +244,11 @@ class MainActivity : ComponentActivity() {
             val analysisProgress by viewModel.analysisProgress.collectAsState()
             val deviceProfile by viewModel.deviceProfile.collectAsState()
 
-            var driveAccountEmail by remember { mutableStateOf("rageshgr0805@gmail.com") }
-            var showSwitchAccountDialog by remember { mutableStateOf(false) }
+            val liveStreamConfig by viewModel.liveStreamConfig.collectAsState()
+            val liveStreamHistory by viewModel.liveStreamHistory.collectAsState()
+
+            val thermalStatus by viewModel.thermalStatus.collectAsState()
+            val showOverheatStopPrompt by viewModel.showOverheatStopPrompt.collectAsState()
 
             val snackbarHostState = remember { SnackbarHostState() }
 
@@ -256,7 +286,7 @@ class MainActivity : ComponentActivity() {
                     topBar = {
                         GamingTopAppBar(
                             isDarkTheme = isDarkTheme,
-                            onToggleTheme = { viewModel.toggleTheme() }
+                            onToggleTheme = { viewModel.toggleTheme(isDarkTheme) }
                         )
                     },
                     bottomBar = {
@@ -326,7 +356,14 @@ class MainActivity : ComponentActivity() {
                                             micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                             return@RecordTabScreen
                                         }
-                                        projectionLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
+                                        val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                                            mediaProjectionManager.createScreenCaptureIntent(
+                                                android.media.projection.MediaProjectionConfig.createConfigForDefaultDisplay()
+                                            )
+                                        } else {
+                                            mediaProjectionManager.createScreenCaptureIntent()
+                                        }
+                                        projectionLauncher.launch(captureIntent)
                                     }
                                 },
                                 onPauseClick = { viewModel.pauseRecording(this@MainActivity) },
@@ -335,7 +372,7 @@ class MainActivity : ComponentActivity() {
                                     viewModel.takeShortClip(this@MainActivity)
                                     Toast.makeText(this@MainActivity, "Saving ${shortClipDurationSeconds}s short clip to ShortClips folder...", Toast.LENGTH_SHORT).show()
                                 },
-                                onGoToSettings = { viewModel.setTab(3) }
+                                onGoToSettings = { viewModel.setTab(4) }
                             )
                             1 -> RecordingsTabScreen(
                                 recordings = recentRecordings,
@@ -354,7 +391,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 },
                                 onUploadToDriveClick = { item ->
-                                    uploadToGoogleDrive(this@MainActivity, item.uri, item.title, driveAccountEmail)
+                                    uploadToGoogleDrive(this@MainActivity, item.uri, item.title)
                                 },
                                 onDeleteClick = {
                                     viewModel.selectItemForAction(it)
@@ -366,15 +403,13 @@ class MainActivity : ComponentActivity() {
                             )
                             2 -> DriveTabScreen(
                                 recordings = recentRecordings,
-                                driveAccountEmail = driveAccountEmail,
-                                onSwitchAccountClick = { showSwitchAccountDialog = true },
                                 onUploadClick = { item ->
-                                    uploadToGoogleDrive(this@MainActivity, item.uri, item.title, driveAccountEmail)
+                                    uploadToGoogleDrive(this@MainActivity, item.uri, item.title)
                                 },
                                 onUploadAllClick = {
                                     val uris = ArrayList(recentRecordings.map { it.uri })
                                     if (uris.isNotEmpty()) {
-                                        uploadMultipleToGoogleDrive(this@MainActivity, uris, driveAccountEmail)
+                                        uploadMultipleToGoogleDrive(this@MainActivity, uris)
                                     } else {
                                         Toast.makeText(this@MainActivity, "No recordings to upload", Toast.LENGTH_SHORT).show()
                                     }
@@ -382,14 +417,48 @@ class MainActivity : ComponentActivity() {
                                 onOpenDriveAppClick = { openGoogleDriveApp(this@MainActivity) },
                                 onRefreshClick = { viewModel.refreshRecordings() }
                             )
-                            3 -> SettingsTabScreen(
+                            3 -> LiveTabScreen(
+                                config = liveStreamConfig,
+                                resolution = selectedResolution,
+                                fps = selectedFps,
+                                bitrate = selectedBitrate,
+                                onConfigChange = { viewModel.updateLiveStreamConfig(it) },
+                                onStartLiveStream = {
+                                    val isRecording = serviceStatus.state == RecordingState.RECORDING ||
+                                            serviceStatus.state == RecordingState.PAUSED
+                                    if (!isRecording) {
+                                        // Record broadcast session into permanent history
+                                        viewModel.recordLiveStreamSession(
+                                            resolution = selectedResolution,
+                                            fps = selectedFps,
+                                            bitrate = selectedBitrate
+                                        )
+                                        Toast.makeText(this@MainActivity, "Launching live broadcast to ${liveStreamConfig.platform}...", Toast.LENGTH_SHORT).show()
+                                        val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                                            mediaProjectionManager.createScreenCaptureIntent(
+                                                android.media.projection.MediaProjectionConfig.createConfigForDefaultDisplay()
+                                            )
+                                        } else {
+                                            mediaProjectionManager.createScreenCaptureIntent()
+                                        }
+                                        projectionLauncher.launch(captureIntent)
+                                    } else {
+                                        Toast.makeText(this@MainActivity, "Screen recording or broadcast is already active.", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            )
+                            4 -> SettingsTabScreen(
                                 deviceProfile = deviceProfile,
+                                thermalStatus = thermalStatus,
+                                liveStreamHistory = liveStreamHistory,
+                                themeMode = themeMode,
                                 resolution = selectedResolution,
                                 fps = selectedFps,
                                 bitrate = selectedBitrate,
                                 shortClipDurationSeconds = shortClipDurationSeconds,
                                 enableFloatingButton = isFloatingButtonEnabled,
                                 isBatteryOptIgnored = isBatteryOptIgnored,
+                                onThemeModeSelected = { viewModel.setThemeMode(it) },
                                 onResolutionSelected = { viewModel.setResolution(it) },
                                 onFpsSelected = { viewModel.setFps(it) },
                                 onBitrateSelected = { viewModel.setBitrate(it) },
@@ -506,56 +575,66 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                // Switch Google Drive Account Dialog
-                if (showSwitchAccountDialog) {
-                    var inputEmail by remember { mutableStateOf(driveAccountEmail) }
+                // First-Run / Manual Hardware Calibration Scanner Dialog
+                if (isAnalyzing) {
+                    HardwareScannerProgressDialog(progress = analysisProgress)
+                }
+
+                // Interactive Overheating Confirmation Alert
+                if (showOverheatStopPrompt) {
                     AlertDialog(
-                        onDismissRequest = { showSwitchAccountDialog = false },
-                        title = { Text("Linked Google Drive Account", fontWeight = FontWeight.Bold) },
+                        onDismissRequest = { viewModel.declineOverheatStop() },
+                        title = {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.BatteryAlert,
+                                    contentDescription = null,
+                                    tint = Color(0xFFFF3B30),
+                                    modifier = Modifier.size(24.dp)
+                                )
+                                Text(
+                                    text = "Device Overheating Alert",
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        },
                         text = {
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text(
-                                    text = "Enter the Google account email where your screen recordings and game clips should be uploaded:",
-                                    style = MaterialTheme.typography.bodyMedium
+                                    text = "I can stop because the reason is overheating.",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface
                                 )
-                                androidx.compose.material3.OutlinedTextField(
-                                    value = inputEmail,
-                                    onValueChange = { inputEmail = it },
-                                    singleLine = true,
-                                    label = { Text("Google Account Email") },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .testTag("drive_email_input")
+                                val tempFormatted = String.format(java.util.Locale.US, "%.1f°C", thermalStatus.temperatureCelsius)
+                                Text(
+                                    text = "Hardware temperature has reached $tempFormatted (${thermalStatus.chargeSource}). Would you like to stop and save the video now?",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         },
                         confirmButton = {
                             Button(
-                                onClick = {
-                                    if (inputEmail.isNotBlank()) {
-                                        driveAccountEmail = inputEmail.trim()
-                                    }
-                                    showSwitchAccountDialog = false
-                                },
+                                onClick = { viewModel.acceptOverheatStop(this@MainActivity) },
                                 colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.onSurface,
-                                    contentColor = MaterialTheme.colorScheme.surface
+                                    containerColor = Color(0xFFE50914),
+                                    contentColor = Color.White
                                 )
                             ) {
-                                Text("Connect Account")
+                                Text("Stop & Save Video", fontWeight = FontWeight.Bold)
                             }
                         },
                         dismissButton = {
-                            TextButton(onClick = { showSwitchAccountDialog = false }) {
-                                Text("Cancel")
+                            TextButton(onClick = { viewModel.declineOverheatStop() }) {
+                                Text("Keep Recording", fontWeight = FontWeight.SemiBold)
                             }
                         }
                     )
-                }
-
-                // First-Run / Manual Hardware Calibration Scanner Dialog
-                if (isAnalyzing) {
-                    HardwareScannerProgressDialog(progress = analysisProgress)
                 }
             }
         }
@@ -698,11 +777,31 @@ private fun GamingBottomNavigation(
             onClick = { onTabSelected(3) },
             icon = {
                 Icon(
+                    painter = painterResource(id = R.drawable.ic_live_broadcast),
+                    contentDescription = "Live Tab",
+                    modifier = Modifier.size(22.dp)
+                )
+            },
+            label = { Text("Live", fontWeight = if (currentTab == 3) FontWeight.Bold else FontWeight.Normal) },
+            colors = NavigationBarItemDefaults.colors(
+                selectedIconColor = MaterialTheme.colorScheme.surface,
+                selectedTextColor = MaterialTheme.colorScheme.onSurface,
+                indicatorColor = MaterialTheme.colorScheme.onSurface,
+                unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        )
+
+        NavigationBarItem(
+            selected = currentTab == 4,
+            onClick = { onTabSelected(4) },
+            icon = {
+                Icon(
                     imageVector = Icons.Filled.Settings,
                     contentDescription = "Settings Tab"
                 )
             },
-            label = { Text("Settings", fontWeight = if (currentTab == 3) FontWeight.Bold else FontWeight.Normal) },
+            label = { Text("Settings", fontWeight = if (currentTab == 4) FontWeight.Bold else FontWeight.Normal) },
             colors = NavigationBarItemDefaults.colors(
                 selectedIconColor = MaterialTheme.colorScheme.surface,
                 selectedTextColor = MaterialTheme.colorScheme.onSurface,
@@ -869,30 +968,6 @@ private fun RecordTabScreen(
             }
         }
 
-        // Best Recommended Setting Hint (Hardware Profile moved to Settings)
-        item {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center
-            ) {
-                Text(
-                    text = "Auto-detected best screen recording profile for your phone • ",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Text(
-                    text = "Settings",
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.clickable { onGoToSettings() }
-                )
-            }
-        }
-
 
         // Audio Source Selection Card
         item {
@@ -1014,8 +1089,6 @@ private fun RecordTabScreen(
 @Composable
 private fun DriveTabScreen(
     recordings: List<RecordingItem>,
-    driveAccountEmail: String,
-    onSwitchAccountClick: () -> Unit,
     onUploadClick: (RecordingItem) -> Unit,
     onUploadAllClick: () -> Unit,
     onOpenDriveAppClick: () -> Unit,
@@ -1028,67 +1101,6 @@ private fun DriveTabScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)
     ) {
-        // Linked Google Drive Account Card
-        item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(42.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF4285F4)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "G",
-                                color = Color.White,
-                                fontWeight = FontWeight.Black,
-                                fontSize = 20.sp
-                            )
-                        }
-                        Column {
-                            Text(
-                                text = "Linked Google Drive",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                text = driveAccountEmail,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-
-                    OutlinedButton(
-                        onClick = onSwitchAccountClick,
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.testTag("switch_drive_account_button")
-                    ) {
-                        Text("Switch", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-        }
-
         // Hero Card
         item {
             Card(
@@ -1125,13 +1137,13 @@ private fun DriveTabScreen(
 
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Google Drive Cloud Hub",
+                                text = "Google Drive",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
-                                text = "Upload recordings and game clips directly to $driveAccountEmail storage.",
+                                text = "Save and access your game recordings and short clips directly in your device's Google Drive.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1353,12 +1365,16 @@ private fun DriveTabScreen(
 @Composable
 private fun SettingsTabScreen(
     deviceProfile: com.example.model.DeviceProfile?,
+    thermalStatus: com.example.system.ThermalStatusInfo = com.example.system.ThermalStatusInfo(),
+    liveStreamHistory: List<com.example.model.LiveStreamHistoryItem> = emptyList(),
+    themeMode: String = "SYSTEM",
     resolution: String,
     fps: Int,
     bitrate: Int,
     shortClipDurationSeconds: Int,
     enableFloatingButton: Boolean,
     isBatteryOptIgnored: Boolean,
+    onThemeModeSelected: (String) -> Unit = {},
     onResolutionSelected: (String) -> Unit,
     onFpsSelected: (Int) -> Unit,
     onBitrateSelected: (Int) -> Unit,
@@ -1367,6 +1383,9 @@ private fun SettingsTabScreen(
     onRequestIgnoreBatteryOpt: () -> Unit,
     onRetuneDevice: () -> Unit
 ) {
+    var showCustomDurationDialog by remember { mutableStateOf(false) }
+    var customDurationInput by remember { mutableStateOf(shortClipDurationSeconds.toString()) }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -1374,6 +1393,298 @@ private fun SettingsTabScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)
     ) {
+        // Theme & Status Bar Visibility Card
+        item {
+            SettingCard(title = "Theme & Status Bar", icon = Icons.Filled.LightMode) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    SegmentButton(
+                        text = "System Default",
+                        selected = themeMode == "SYSTEM",
+                        onClick = { onThemeModeSelected("SYSTEM") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    SegmentButton(
+                        text = "Dark (Black)",
+                        selected = themeMode == "DARK",
+                        onClick = { onThemeModeSelected("DARK") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    SegmentButton(
+                        text = "Light (White)",
+                        selected = themeMode == "LIGHT",
+                        onClick = { onThemeModeSelected("LIGHT") },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Text(
+                    text = "Controls black/white theme. In Dark mode, status bar icons (battery %, signal, clock) are rendered in bright white. In Light mode, they render in crisp dark.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        // Hardware Thermal & Charging Guard Card
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.BatteryAlert,
+                                contentDescription = null,
+                                modifier = Modifier.size(20.dp),
+                                tint = if (thermalStatus.isCriticalHeat) Color(0xFFFF3B30) else if (thermalStatus.isOverheating) Color(0xFFFF9500) else Color(0xFF34C759)
+                            )
+                            Text(
+                                text = "Thermal & Charging Guard",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+
+                        // Real-time Temperature pill
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (thermalStatus.isCriticalHeat) Color(0xFF3B1E1E) else if (thermalStatus.isOverheating) Color(0xFF3B2E1E) else MaterialTheme.colorScheme.surface,
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                if (thermalStatus.isCriticalHeat) Color(0xFFFF3B30) else if (thermalStatus.isOverheating) Color(0xFFFF9500) else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
+                            )
+                        ) {
+                            Text(
+                                text = "${String.format(java.util.Locale.US, "%.1f", thermalStatus.temperatureCelsius)}°C",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = if (thermalStatus.isCriticalHeat) Color(0xFFFF3B30) else if (thermalStatus.isOverheating) Color(0xFFFF9500) else MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    // Telemetry Grid
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(MaterialTheme.colorScheme.surface)
+                            .padding(10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column {
+                            Text("Power Source", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(thermalStatus.chargeSource, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("OS Thermal Status", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(thermalStatus.thermalDescription, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                        }
+                    }
+
+                    Text(
+                        text = "Gaming while charging increases device heat. If overheating occurs, you will be asked: 'I can stop because the reason is overheating.' Recording will NEVER stop automatically unless you confirm.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+
+        // Live Stream History Card (Permanent, cannot be deleted)
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
+                    .testTag("live_stream_history_section")
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                painter = painterResource(id = R.drawable.ic_live_broadcast),
+                                contentDescription = null,
+                                modifier = Modifier.size(20.dp),
+                                tint = Color(0xFFE50914)
+                            )
+                            Text(
+                                text = "Live Stream History",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surface,
+                            border = androidx.compose.foundation.BorderStroke(
+                                1.dp,
+                                MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
+                            )
+                        ) {
+                            Text(
+                                text = "${liveStreamHistory.size} Broadcast${if (liveStreamHistory.size == 1) "" else "s"}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    Text(
+                        text = "Permanent audit log of all live broadcasts (Platform, Date, Format, Output Resolution & Frame Rate). This history cannot be deleted.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    if (liveStreamHistory.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surface)
+                                .padding(16.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "No live broadcasts recorded yet. Start streaming from the Live tab to log your history here.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            )
+                        }
+                    } else {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            liveStreamHistory.forEach { item ->
+                                val platformColor = when (item.platform.uppercase()) {
+                                    "YOUTUBE" -> Color(0xFFFF0000)
+                                    "TWITCH" -> Color(0xFF9146FF)
+                                    "FACEBOOK" -> Color(0xFF1877F2)
+                                    "INSTAGRAM" -> Color(0xFFE1306C)
+                                    else -> Color(0xFF8E8E93)
+                                }
+
+                                Surface(
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = MaterialTheme.colorScheme.surface,
+                                    border = androidx.compose.foundation.BorderStroke(
+                                        1.dp,
+                                        MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+                                    ),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Surface(
+                                                shape = RoundedCornerShape(6.dp),
+                                                color = platformColor.copy(alpha = 0.15f),
+                                                border = androidx.compose.foundation.BorderStroke(
+                                                    1.dp,
+                                                    platformColor.copy(alpha = 0.6f)
+                                                )
+                                            ) {
+                                                Text(
+                                                    text = item.platform,
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = platformColor,
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                )
+                                            }
+
+                                            Text(
+                                                text = item.dateFormatted,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+
+                                        Text(
+                                            text = item.streamTitle,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = "${item.resolution} @ ${item.fps} FPS (${item.bitrateMbps} Mbps) • ${item.orientation}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.primary,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                        }
+
+                                        Text(
+                                            text = "Endpoint: ${item.streamServer}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                            maxLines = 1,
+                                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Hardware Device Tuning Card
         item {
             Card(
@@ -1508,38 +1819,55 @@ private fun SettingsTabScreen(
 
         // Short Clip Duration Setting Card
         item {
+            val isCustomDuration = shortClipDurationSeconds !in listOf(15, 30, 60, 120)
             SettingCard(title = "Short Clip Duration", icon = Icons.Filled.VideoLibrary) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    SegmentButton(
-                        text = "15 Sec",
-                        selected = shortClipDurationSeconds == 15,
-                        onClick = { onShortClipDurationSelected(15) },
-                        modifier = Modifier.weight(1f)
-                    )
-                    SegmentButton(
-                        text = "30 Sec (Default)",
-                        selected = shortClipDurationSeconds == 30,
-                        onClick = { onShortClipDurationSelected(30) },
-                        modifier = Modifier.weight(1f)
-                    )
-                    SegmentButton(
-                        text = "60 Sec",
-                        selected = shortClipDurationSeconds == 60,
-                        onClick = { onShortClipDurationSelected(60) },
-                        modifier = Modifier.weight(1f)
-                    )
-                    SegmentButton(
-                        text = "2 Min",
-                        selected = shortClipDurationSeconds == 120,
-                        onClick = { onShortClipDurationSelected(120) },
-                        modifier = Modifier.weight(1f)
-                    )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        SegmentButton(
+                            text = "15 Sec",
+                            selected = shortClipDurationSeconds == 15,
+                            onClick = { onShortClipDurationSelected(15) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SegmentButton(
+                            text = "30s (Default)",
+                            selected = shortClipDurationSeconds == 30,
+                            onClick = { onShortClipDurationSelected(30) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SegmentButton(
+                            text = "60 Sec",
+                            selected = shortClipDurationSeconds == 60,
+                            onClick = { onShortClipDurationSelected(60) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        SegmentButton(
+                            text = "2 Min (120s)",
+                            selected = shortClipDurationSeconds == 120,
+                            onClick = { onShortClipDurationSelected(120) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SegmentButton(
+                            text = if (isCustomDuration) "Custom (${shortClipDurationSeconds}s)" else "Customize...",
+                            selected = isCustomDuration,
+                            onClick = {
+                                customDurationInput = shortClipDurationSeconds.toString()
+                                showCustomDurationDialog = true
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                 }
                 Text(
-                    text = "When you press the Short Clip button during a recording, the last $shortClipDurationSeconds seconds of footage will be extracted into a separate video and saved into the dedicated ShortClips folder.",
+                    text = "When you press the Short Clip button on the edge slider during gameplay, the last $shortClipDurationSeconds seconds of footage will be extracted into a separate video and saved into the ShortClips folder.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1677,6 +2005,51 @@ private fun SettingsTabScreen(
                 }
             }
         }
+    }
+
+    if (showCustomDurationDialog) {
+        AlertDialog(
+            onDismissRequest = { showCustomDurationDialog = false },
+            title = { Text("Customize Short Clip Duration", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Enter clip duration in seconds (between 5 and 300 seconds):",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    androidx.compose.material3.OutlinedTextField(
+                        value = customDurationInput,
+                        onValueChange = { customDurationInput = it.filter { ch -> ch.isDigit() } },
+                        singleLine = true,
+                        label = { Text("Seconds") },
+                        placeholder = { Text("e.g. 45") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("custom_clip_duration_input")
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val secs = customDurationInput.toIntOrNull()?.coerceIn(5, 300) ?: 30
+                        onShortClipDurationSelected(secs)
+                        showCustomDurationDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.onSurface,
+                        contentColor = MaterialTheme.colorScheme.surface
+                    )
+                ) {
+                    Text("Apply")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCustomDurationDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 
@@ -2196,14 +2569,13 @@ private fun InAppVideoPlayerDialog(
     }
 }
 
-private fun uploadToGoogleDrive(context: Context, uri: Uri, title: String, accountEmail: String = "rageshgr0805@gmail.com") {
+private fun uploadToGoogleDrive(context: Context, uri: Uri, title: String) {
     try {
-        Toast.makeText(context, "Opening Google Drive ($accountEmail)...", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, "Opening Google Drive...", Toast.LENGTH_SHORT).show()
         val driveIntent = Intent(Intent.ACTION_SEND).apply {
             type = "video/mp4"
             putExtra(Intent.EXTRA_STREAM, uri)
             putExtra(Intent.EXTRA_SUBJECT, title)
-            putExtra("account_name", accountEmail)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             setPackage("com.google.android.apps.docs")
         }
@@ -2216,10 +2588,9 @@ private fun uploadToGoogleDrive(context: Context, uri: Uri, title: String, accou
                     type = "video/mp4"
                     putExtra(Intent.EXTRA_STREAM, uri)
                     putExtra(Intent.EXTRA_SUBJECT, title)
-                    putExtra("account_name", accountEmail)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 },
-                "Upload to Google Drive ($accountEmail)"
+                "Upload to Google Drive"
             )
             context.startActivity(chooser)
         }
@@ -2228,13 +2599,12 @@ private fun uploadToGoogleDrive(context: Context, uri: Uri, title: String, accou
     }
 }
 
-private fun uploadMultipleToGoogleDrive(context: Context, uris: ArrayList<Uri>, accountEmail: String = "rageshgr0805@gmail.com") {
+private fun uploadMultipleToGoogleDrive(context: Context, uris: ArrayList<Uri>) {
     try {
-        Toast.makeText(context, "Uploading ${uris.size} videos to Google Drive ($accountEmail)...", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, "Uploading ${uris.size} videos to Google Drive...", Toast.LENGTH_SHORT).show()
         val driveIntent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
             type = "video/*"
             putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-            putExtra("account_name", accountEmail)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             setPackage("com.google.android.apps.docs")
         }
@@ -2246,10 +2616,9 @@ private fun uploadMultipleToGoogleDrive(context: Context, uris: ArrayList<Uri>, 
                 Intent(Intent.ACTION_SEND_MULTIPLE).apply {
                     type = "video/*"
                     putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-                    putExtra("account_name", accountEmail)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 },
-                "Upload All to Google Drive ($accountEmail)"
+                "Upload All to Google Drive"
             )
             context.startActivity(chooser)
         }
@@ -2260,12 +2629,24 @@ private fun uploadMultipleToGoogleDrive(context: Context, uris: ArrayList<Uri>, 
 
 private fun openGoogleDriveApp(context: Context) {
     try {
-        val intent = context.packageManager.getLaunchIntentForPackage("com.google.android.apps.docs")
-        if (intent != null) {
-            context.startActivity(intent)
+        val launchIntent = context.packageManager.getLaunchIntentForPackage("com.google.android.apps.docs")
+        if (launchIntent != null) {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(launchIntent)
         } else {
-            val webIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://drive.google.com"))
-            context.startActivity(webIntent)
+            val driveIntent = Intent(Intent.ACTION_VIEW).apply {
+                setPackage("com.google.android.apps.docs")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (context.packageManager.queryIntentActivities(driveIntent, 0).isNotEmpty()) {
+                context.startActivity(driveIntent)
+            } else {
+                Toast.makeText(context, "Google Drive app is not installed. Opening Google Play Store...", Toast.LENGTH_LONG).show()
+                val marketIntent = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.android.apps.docs")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(marketIntent)
+            }
         }
     } catch (e: Exception) {
         Toast.makeText(context, "Could not open Google Drive: ${e.message}", Toast.LENGTH_SHORT).show()

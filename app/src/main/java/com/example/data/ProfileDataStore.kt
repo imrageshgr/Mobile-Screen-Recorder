@@ -50,6 +50,23 @@ class ProfileDataStore(private val context: Context) {
         private val KEY_ENABLE_OVERLAY_TRIGGER = booleanPreferencesKey("enable_overlay_trigger")
         private val KEY_INITIAL_SCAN_COMPLETED = booleanPreferencesKey("initial_hardware_scan_completed")
         private val KEY_SHORT_CLIP_SECONDS = intPreferencesKey("short_clip_duration_seconds")
+        private val KEY_THEME_MODE = stringPreferencesKey("theme_mode")
+        private val KEY_DRIVE_ACCOUNT = stringPreferencesKey("drive_account_email")
+
+        private val KEY_LIVE_PLATFORM = stringPreferencesKey("live_platform")
+        private val KEY_LIVE_STREAM_URL = stringPreferencesKey("live_stream_url")
+        private val KEY_LIVE_STREAM_KEY = stringPreferencesKey("live_stream_key")
+        private val KEY_LIVE_STREAM_TITLE = stringPreferencesKey("live_stream_title")
+        private val KEY_LIVE_ORIENTATION = stringPreferencesKey("live_stream_orientation")
+        private val KEY_LAYOUT_ENABLED = booleanPreferencesKey("live_layout_enabled")
+        private val KEY_LAYOUT_BANNER_TEXT = stringPreferencesKey("live_layout_banner_text")
+        private val KEY_LAYOUT_BANNER_POS = stringPreferencesKey("live_layout_banner_pos")
+        private val KEY_LAYOUT_BADGE_STYLE = stringPreferencesKey("live_layout_badge_style")
+        private val KEY_LAYOUT_CAM_PIP = booleanPreferencesKey("live_layout_cam_pip")
+        private val KEY_LAYOUT_CAM_POS = stringPreferencesKey("live_layout_cam_pos")
+        private val KEY_LAYOUT_WATERMARK = booleanPreferencesKey("live_layout_watermark")
+        private val KEY_LAYOUT_WATERMARK_TEXT = stringPreferencesKey("live_layout_watermark_text")
+        private val KEY_LIVE_STREAM_HISTORY = stringPreferencesKey("live_stream_history_json")
     }
 
     val savedProfile: Flow<DeviceProfile?> = context.dataStore.data
@@ -248,5 +265,90 @@ class ProfileDataStore(private val context: Context) {
 
     suspend fun setShortClipDurationSeconds(seconds: Int) {
         context.dataStore.edit { prefs -> prefs[KEY_SHORT_CLIP_SECONDS] = seconds }
+    }
+
+    val themeMode: Flow<String> = context.dataStore.data
+        .catch { emit(emptyPreferences()) }
+        .map { prefs -> prefs[KEY_THEME_MODE] ?: "SYSTEM" }
+
+    suspend fun setThemeMode(mode: String) {
+        context.dataStore.edit { prefs -> prefs[KEY_THEME_MODE] = mode }
+    }
+
+    val driveAccountEmail: Flow<String> = context.dataStore.data
+        .catch { emit(emptyPreferences()) }
+        .map { prefs -> prefs[KEY_DRIVE_ACCOUNT] ?: "" }
+
+    suspend fun setDriveAccountEmail(email: String) {
+        context.dataStore.edit { prefs -> prefs[KEY_DRIVE_ACCOUNT] = email }
+    }
+
+    val liveStreamConfig: Flow<com.example.model.LiveStreamConfig> = context.dataStore.data
+        .catch { emit(emptyPreferences()) }
+        .map { prefs ->
+            val platform = prefs[KEY_LIVE_PLATFORM] ?: com.example.model.LiveStreamConfig.PLATFORM_YOUTUBE
+            val defaultUrl = com.example.model.LiveStreamConfig.getDefaultUrlForPlatform(platform)
+            com.example.model.LiveStreamConfig(
+                platform = platform,
+                streamUrl = prefs[KEY_LIVE_STREAM_URL] ?: defaultUrl,
+                streamKey = prefs[KEY_LIVE_STREAM_KEY] ?: "",
+                streamTitle = prefs[KEY_LIVE_STREAM_TITLE] ?: "Mobile Game Live Stream",
+                orientation = prefs[KEY_LIVE_ORIENTATION] ?: "HORIZONTAL",
+                isLayoutEnabled = prefs[KEY_LAYOUT_ENABLED] ?: true,
+                bannerText = prefs[KEY_LAYOUT_BANNER_TEXT] ?: "GAMER_PRO • LIVE",
+                bannerPosition = prefs[KEY_LAYOUT_BANNER_POS] ?: "BOTTOM_LEFT",
+                badgeStyle = prefs[KEY_LAYOUT_BADGE_STYLE] ?: "LIVE_RED",
+                isCameraPipEnabled = prefs[KEY_LAYOUT_CAM_PIP] ?: true,
+                cameraPipPosition = prefs[KEY_LAYOUT_CAM_POS] ?: "TOP_RIGHT",
+                isWatermarkEnabled = true,
+                watermarkText = prefs[KEY_LAYOUT_WATERMARK_TEXT] ?: "GAMER PRO"
+            )
+        }
+
+    suspend fun saveLiveStreamConfig(config: com.example.model.LiveStreamConfig) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_LIVE_PLATFORM] = config.platform
+            prefs[KEY_LIVE_STREAM_URL] = config.streamUrl
+            prefs[KEY_LIVE_STREAM_KEY] = config.streamKey
+            prefs[KEY_LIVE_STREAM_TITLE] = config.streamTitle
+            prefs[KEY_LIVE_ORIENTATION] = config.orientation
+            prefs[KEY_LAYOUT_ENABLED] = config.isLayoutEnabled
+            prefs[KEY_LAYOUT_BANNER_TEXT] = config.bannerText
+            prefs[KEY_LAYOUT_BANNER_POS] = config.bannerPosition
+            prefs[KEY_LAYOUT_BADGE_STYLE] = config.badgeStyle
+            prefs[KEY_LAYOUT_CAM_PIP] = config.isCameraPipEnabled
+            prefs[KEY_LAYOUT_CAM_POS] = config.cameraPipPosition
+            prefs[KEY_LAYOUT_WATERMARK] = true
+            prefs[KEY_LAYOUT_WATERMARK_TEXT] = config.watermarkText
+        }
+    }
+
+    val liveStreamHistory: Flow<List<com.example.model.LiveStreamHistoryItem>> = context.dataStore.data
+        .catch { emit(emptyPreferences()) }
+        .map { prefs ->
+            val jsonStr = prefs[KEY_LIVE_STREAM_HISTORY] ?: "[]"
+            try {
+                val array = org.json.JSONArray(jsonStr)
+                val list = mutableListOf<com.example.model.LiveStreamHistoryItem>()
+                for (i in 0 until array.length()) {
+                    list.add(com.example.model.LiveStreamHistoryItem.fromJson(array.getJSONObject(i)))
+                }
+                list.sortedByDescending { it.timestamp }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+    suspend fun addLiveStreamHistoryItem(item: com.example.model.LiveStreamHistoryItem) {
+        context.dataStore.edit { prefs ->
+            val jsonStr = prefs[KEY_LIVE_STREAM_HISTORY] ?: "[]"
+            val array = try {
+                org.json.JSONArray(jsonStr)
+            } catch (_: Exception) {
+                org.json.JSONArray()
+            }
+            array.put(item.toJson())
+            prefs[KEY_LIVE_STREAM_HISTORY] = array.toString()
+        }
     }
 }

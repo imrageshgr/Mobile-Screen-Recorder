@@ -42,6 +42,8 @@ import com.example.model.RecordingState
 import com.example.model.ServiceStatus
 import com.example.overlay.FloatingControlOverlay
 import com.example.repository.VideoRepository
+import com.example.system.ThermalChargingMonitor
+import com.example.system.ThermalStatusInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -71,6 +73,7 @@ class ScreenRecordService : Service() {
         const val ACTION_PAUSE = "com.example.action.PAUSE_RECORDING"
         const val ACTION_RESUME = "com.example.action.RESUME_RECORDING"
         const val ACTION_SHORT_CLIP = "com.example.action.SHORT_CLIP"
+        const val ACTION_DISMISS_THERMAL_ALERT = "com.example.action.DISMISS_THERMAL_ALERT"
 
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
@@ -144,6 +147,11 @@ class ScreenRecordService : Service() {
     // Floating UI controls
     private var floatingOverlay: FloatingControlOverlay? = null
 
+    // Hardware Thermal & Charging Guard telemetry
+    private var thermalMonitor: ThermalChargingMonitor? = null
+    private var userDeclinedThermalStop = false
+    private var currentThermalInfo = ThermalStatusInfo()
+
     // Corner Hit Box overlay (optional backup)
     private var windowManager: WindowManager? = null
     private var overlayView: View? = null
@@ -173,8 +181,15 @@ class ScreenRecordService : Service() {
             ACTION_PAUSE -> handlePause()
             ACTION_RESUME -> handleResume()
             ACTION_SHORT_CLIP -> handleTakeShortClip()
+            ACTION_DISMISS_THERMAL_ALERT -> handleDismissThermalAlert()
         }
         return START_NOT_STICKY
+    }
+
+    private fun handleDismissThermalAlert() {
+        logDebug("THERMAL_DECLINED", "User declined overheat stop. Respecting user decision, recording continues without stopping.")
+        userDeclinedThermalStop = true
+        updateNotification("Recording: ${formatTime(totalElapsedSeconds)}")
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -473,6 +488,30 @@ class ScreenRecordService : Service() {
         serviceScope.launch(Dispatchers.Main) {
             startTimer()
             setupFloatingControlOverlay()
+
+            // Initialize real hardware thermal & charging monitor
+            userDeclinedThermalStop = false
+            try {
+                thermalMonitor?.stopMonitoring()
+            } catch (_: Exception) {}
+            val monitor = ThermalChargingMonitor(this@ScreenRecordService).apply {
+                startMonitoring()
+            }
+            thermalMonitor = monitor
+
+            serviceScope.launch {
+                monitor.statusFlow.collect { status ->
+                    currentThermalInfo = status
+                    floatingOverlay?.updateThermalAlert(
+                        tempCelsius = status.temperatureCelsius,
+                        isOverheating = status.isOverheating,
+                        isCritical = status.isCriticalHeat
+                    )
+                    if (isRecording && status.isCriticalHeat && !userDeclinedThermalStop) {
+                        updateNotification("I can stop because the reason is overheating.")
+                    }
+                }
+            }
         }
 
         logDebug("RECORDING_ACTIVE", "Screen recording started successfully into ${outputFile.name}")
@@ -611,13 +650,19 @@ class ScreenRecordService : Service() {
                 tempAudioFile = null
             }
 
-            // 6. Release WakeLock
+            // 6. Release WakeLock & stop thermal monitor
             try {
                 if (wakeLock?.isHeld == true) {
                     wakeLock?.release()
                 }
             } catch (_: Exception) {}
             wakeLock = null
+
+            try {
+                thermalMonitor?.stopMonitoring()
+            } catch (_: Exception) {}
+            thermalMonitor = null
+            userDeclinedThermalStop = false
 
             // 7. Back-Test Verification Step: check file exists and length > 0
             val fileExists = outputFile != null && outputFile.exists() && outputFile.length() > 0L
@@ -720,7 +765,14 @@ class ScreenRecordService : Service() {
 
                     // Throttle notification updates to every 2 seconds to avoid notification manager rate limits
                     if (totalElapsedSeconds % 2 == 0) {
-                        updateNotification("Recording: $timeStr")
+                        val baseText = if (currentThermalInfo.isCriticalHeat && !userDeclinedThermalStop) {
+                            "I can stop because the reason is overheating."
+                        } else if (currentThermalInfo.isCharging && currentThermalInfo.temperatureCelsius >= ThermalChargingMonitor.TEMP_THRESHOLD_WARMING) {
+                            "Recording: $timeStr • ⚡ ${String.format(Locale.US, "%.1f", currentThermalInfo.temperatureCelsius)}°C Charging"
+                        } else {
+                            "Recording: $timeStr"
+                        }
+                        updateNotification(baseText)
                     }
 
                     _serviceStatus.value = _serviceStatus.value.copy(
@@ -755,6 +807,7 @@ class ScreenRecordService : Service() {
             floatingOverlay?.dismiss()
             floatingOverlay = FloatingControlOverlay(
                 context = this@ScreenRecordService,
+                shortClipDurationSeconds = shortClipDurationSeconds,
                 onPauseClick = { handlePause() },
                 onResumeClick = { handleResume() },
                 onStopClick = { handleStopAndSave() },
@@ -762,7 +815,7 @@ class ScreenRecordService : Service() {
             ).apply {
                 show()
             }
-            logDebug("SIDE_SLIDER", "Side slider edge controls initialized")
+            logDebug("SIDE_SLIDER", "Side slider edge controls initialized with ${shortClipDurationSeconds}s clip")
         } catch (e: Exception) {
             Log.w(TAG, "Could not initialize side slider overlay: ${e.message}")
             if (enableOverlayTrigger) setupInvisibleOverlayTrigger()
@@ -862,6 +915,45 @@ class ScreenRecordService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // Check if critical overheating alert prompt should be presented to user
+        val isOverheatingAlertActive = currentThermalInfo.isCriticalHeat && !userDeclinedThermalStop
+
+        if (isOverheatingAlertActive) {
+            val dismissThermalIntent = Intent(this, ScreenRecordService::class.java).apply {
+                action = ACTION_DISMISS_THERMAL_ALERT
+            }
+            val dismissThermalPendingIntent = PendingIntent.getService(
+                this,
+                3,
+                dismissThermalIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val tempStr = String.format(Locale.US, "%.1f°C", currentThermalInfo.temperatureCelsius)
+            return NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle("⚠️ Overheating Alert ($tempStr)")
+                .setContentText("I can stop because the reason is overheating.")
+                .setStyle(
+                    NotificationCompat.BigTextStyle()
+                        .bigText("I can stop because the reason is overheating.\nHardware temperature has reached $tempStr (${currentThermalInfo.chargeSource}). Stop recording now?")
+                )
+                .setSmallIcon(R.drawable.ic_stat_record)
+                .setContentIntent(openPendingIntent)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .addAction(
+                    android.R.drawable.ic_menu_save,
+                    "Stop & Save (Accept)",
+                    stopPendingIntent
+                )
+                .addAction(
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    "Keep Recording (Decline)",
+                    dismissThermalPendingIntent
+                )
+                .build()
+        }
+
         val pauseResumeIntent = Intent(this, ScreenRecordService::class.java).apply {
             action = if (isPaused) ACTION_RESUME else ACTION_PAUSE
         }
@@ -872,9 +964,15 @@ class ScreenRecordService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val displayText = if (!contentText.contains("⚡") && currentThermalInfo.isCharging && currentThermalInfo.temperatureCelsius >= ThermalChargingMonitor.TEMP_THRESHOLD_WARMING) {
+            "$contentText • ⚡ ${String.format(Locale.US, "%.1f", currentThermalInfo.temperatureCelsius)}°C"
+        } else {
+            contentText
+        }
+
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Screen Recording")
-            .setContentText(contentText)
+            .setContentText(displayText)
             .setSmallIcon(R.drawable.ic_stat_record)
             .setContentIntent(openPendingIntent)
             .setOngoing(true)
@@ -948,6 +1046,11 @@ class ScreenRecordService : Service() {
         isRecording = false
         removeOverlays()
         timerJob?.cancel()
+        try {
+            thermalMonitor?.stopMonitoring()
+        } catch (_: Exception) {}
+        thermalMonitor = null
+        userDeclinedThermalStop = false
         _isRecordingFlow.value = false
         super.onDestroy()
     }
