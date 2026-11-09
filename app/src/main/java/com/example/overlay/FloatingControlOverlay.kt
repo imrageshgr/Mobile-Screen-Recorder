@@ -46,11 +46,14 @@ import com.example.R
 class FloatingControlOverlay(
     private val context: Context,
     private val shortClipDurationSeconds: Int = 30,
+    private val isLiveStream: Boolean = false,
+    private val isMicInitialActive: Boolean = false,
     private val onPauseClick: () -> Unit = {},
     private val onResumeClick: () -> Unit = {},
     private val onStopClick: () -> Unit = {},
     private val onEndClick: () -> Unit = {},
-    private val onShortClipClick: () -> Unit = {}
+    private val onShortClipClick: () -> Unit = {},
+    private val onToggleMicClick: (Boolean) -> Unit = {}
 ) {
     // Secondary constructor for compatibility
     constructor(
@@ -61,11 +64,14 @@ class FloatingControlOverlay(
     ) : this(
         context = context,
         shortClipDurationSeconds = 30,
+        isLiveStream = false,
+        isMicInitialActive = false,
         onPauseClick = onPauseResumeClick,
         onResumeClick = onPauseResumeClick,
         onStopClick = onStopClick,
         onEndClick = onStopClick,
-        onShortClipClick = {}
+        onShortClipClick = {},
+        onToggleMicClick = {}
     )
 
     companion object {
@@ -86,10 +92,12 @@ class FloatingControlOverlay(
     private var handleTimerText: TextView? = null
     private var expandedTimerText: TextView? = null
     private var pauseResumeBtn: ImageView? = null
+    private var micToggleBtn: ImageView? = null
     private var stopSaveBtn: ImageView? = null
     private var shortClipBtn: ImageView? = null
     private var collapseChevron: TextView? = null
 
+    private var isMicActive = isMicInitialActive
     private var isPaused = false
     private var isSaving = false
     private var isExpanded = false
@@ -335,12 +343,27 @@ class FloatingControlOverlay(
             }
             addView(pauseResumeBtn)
 
-            // BUTTON 2: Stop & Save (Prominent Red Button)
+            // BUTTON 2: Live Mic Toggle Button
+            micToggleBtn = createSliderButton(
+                iconRes = if (isMicActive) R.drawable.ic_overlay_mic else R.drawable.ic_overlay_mic_off,
+                tintColor = if (isMicActive) Color.parseColor("#34C759") else Color.parseColor("#FF3B30"),
+                bgColor = if (isMicActive) Color.parseColor("#1B3820") else Color.parseColor("#282834"),
+                contentDesc = if (isMicActive) "Microphone Active (Tap to Mute)" else "Microphone Muted (Tap to Unmute)"
+            ) {
+                if (isSaving) return@createSliderButton
+                isMicActive = !isMicActive
+                updateMicButtonUi()
+                onToggleMicClick(isMicActive)
+                resetAutoCollapseTimer()
+            }
+            addView(micToggleBtn)
+
+            // BUTTON 3: Stop & Save (Prominent Red Button)
             stopSaveBtn = createSliderButton(
                 iconRes = R.drawable.ic_overlay_stop,
                 tintColor = Color.WHITE,
                 bgColor = Color.parseColor("#E02424"),
-                contentDesc = "Stop and Save Recording"
+                contentDesc = if (isLiveStream) "Stop Live Stream" else "Stop and Save Recording"
             ) {
                 triggerFinishAndSave()
             }
@@ -545,6 +568,24 @@ class FloatingControlOverlay(
         val metrics = getDisplayMetrics()
         val maxY = metrics.heightPixels - (120 * context.resources.displayMetrics.density).toInt()
         layoutParams.y = layoutParams.y.coerceIn(80, maxY.coerceAtLeast(80))
+    }
+
+    fun setMicActiveState(active: Boolean) {
+        mainHandler.post {
+            isMicActive = active
+            updateMicButtonUi()
+        }
+    }
+
+    private fun updateMicButtonUi() {
+        micToggleBtn?.apply {
+            setImageResource(if (isMicActive) R.drawable.ic_overlay_mic else R.drawable.ic_overlay_mic_off)
+            setColorFilter(if (isMicActive) Color.parseColor("#34C759") else Color.parseColor("#FF3B30"))
+            (background as? GradientDrawable)?.setColor(
+                if (isMicActive) Color.parseColor("#1B3820") else Color.parseColor("#282834")
+            )
+            contentDescription = if (isMicActive) "Microphone Active (Tap to Mute)" else "Microphone Muted (Tap to Unmute)"
+        }
     }
 
     private fun getDisplayMetrics(): DisplayMetrics {

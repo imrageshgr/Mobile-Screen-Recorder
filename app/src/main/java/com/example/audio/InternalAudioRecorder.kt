@@ -35,6 +35,7 @@ class InternalAudioRecorder(
     private val mediaProjection: MediaProjection,
     private val outputFile: File,
     private val includeMic: Boolean = false,
+    private val includeVoiceChat: Boolean = true,
     private val sampleRate: Int = 44100,
     private val audioBitrate: Int = 128000
 ) {
@@ -54,6 +55,9 @@ class InternalAudioRecorder(
     private var isMuxerStarted = false
 
     @Volatile
+    var isMicMuted: Boolean = false
+
+    @Volatile
     private var isRunning = false
     private var workerThread: Thread? = null
     private val lock = Any()
@@ -69,12 +73,18 @@ class InternalAudioRecorder(
             if (isRunning) return true
 
             try {
-                // 1. Configure Internal Audio Playback Capture
-                val playbackConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
+                // 1. Configure Internal Audio Playback Capture (Media, Game & Teammates' in-game Voice Chat)
+                val playbackConfigBuilder = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
                     .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                     .addMatchingUsage(AudioAttributes.USAGE_GAME)
                     .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                    .build()
+
+                if (includeVoiceChat) {
+                    // Captures VoIP voice communication so teammates' in-game voice chat is captured
+                    playbackConfigBuilder.addMatchingUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    playbackConfigBuilder.addMatchingUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING)
+                }
+                val playbackConfig = playbackConfigBuilder.build()
 
                 val minBufSize = AudioRecord.getMinBufferSize(sampleRate, CHANNEL_CONFIG, AUDIO_FORMAT)
                 val bufferSize = (minBufSize * 4).coerceAtLeast(16384)
@@ -191,7 +201,7 @@ class InternalAudioRecorder(
                 0
             }
 
-            val micRead = if (mic != null && micBuf != null) {
+            val micRead = if (mic != null && micBuf != null && !isMicMuted) {
                 try {
                     val targetLen = if (playRead > 0) playRead else pcmChunkShorts
                     val r = mic.read(micBuf, 0, targetLen)

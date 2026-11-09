@@ -67,6 +67,8 @@ class ProfileDataStore(private val context: Context) {
         private val KEY_LAYOUT_WATERMARK = booleanPreferencesKey("live_layout_watermark")
         private val KEY_LAYOUT_WATERMARK_TEXT = stringPreferencesKey("live_layout_watermark_text")
         private val KEY_LIVE_STREAM_HISTORY = stringPreferencesKey("live_stream_history_json")
+        private val KEY_LIVE_STREAM_DELAY = intPreferencesKey("live_stream_delay_seconds")
+        private val KEY_LIVE_AUDIO_MODE = stringPreferencesKey("live_stream_audio_mode")
     }
 
     val savedProfile: Flow<DeviceProfile?> = context.dataStore.data
@@ -286,13 +288,15 @@ class ProfileDataStore(private val context: Context) {
     val liveStreamConfig: Flow<com.example.model.LiveStreamConfig> = context.dataStore.data
         .catch { emit(emptyPreferences()) }
         .map { prefs ->
-            val platform = prefs[KEY_LIVE_PLATFORM] ?: com.example.model.LiveStreamConfig.PLATFORM_YOUTUBE
+            val platform = prefs[KEY_LIVE_PLATFORM] ?: com.example.model.LiveStreamConfig.PLATFORM_CUSTOM
             val defaultUrl = com.example.model.LiveStreamConfig.getDefaultUrlForPlatform(platform)
             com.example.model.LiveStreamConfig(
                 platform = platform,
                 streamUrl = prefs[KEY_LIVE_STREAM_URL] ?: defaultUrl,
                 streamKey = prefs[KEY_LIVE_STREAM_KEY] ?: "",
                 streamTitle = prefs[KEY_LIVE_STREAM_TITLE] ?: "Mobile Game Live Stream",
+                streamDelaySeconds = prefs[KEY_LIVE_STREAM_DELAY] ?: 5,
+                audioMode = prefs[KEY_LIVE_AUDIO_MODE] ?: com.example.model.LiveStreamConfig.AUDIO_MODE_GAME_AND_MIC,
                 orientation = prefs[KEY_LIVE_ORIENTATION] ?: "HORIZONTAL",
                 isLayoutEnabled = prefs[KEY_LAYOUT_ENABLED] ?: true,
                 bannerText = prefs[KEY_LAYOUT_BANNER_TEXT] ?: "GAMER_PRO • LIVE",
@@ -311,6 +315,8 @@ class ProfileDataStore(private val context: Context) {
             prefs[KEY_LIVE_STREAM_URL] = config.streamUrl
             prefs[KEY_LIVE_STREAM_KEY] = config.streamKey
             prefs[KEY_LIVE_STREAM_TITLE] = config.streamTitle
+            prefs[KEY_LIVE_STREAM_DELAY] = config.streamDelaySeconds
+            prefs[KEY_LIVE_AUDIO_MODE] = config.audioMode
             prefs[KEY_LIVE_ORIENTATION] = config.orientation
             prefs[KEY_LAYOUT_ENABLED] = config.isLayoutEnabled
             prefs[KEY_LAYOUT_BANNER_TEXT] = config.bannerText
