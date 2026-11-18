@@ -15,7 +15,6 @@ import android.content.res.Configuration
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -124,16 +123,15 @@ class ScreenRecordService : Service() {
     // Recording core components
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private var mediaRecorder: MediaRecorder? = null
+    private var videoEncoder: com.example.recorder.VideoEncoderWrapper? = null
     private var internalAudioRecorder: com.example.audio.InternalAudioRecorder? = null
+    private var muxerCoordinator: com.example.recorder.MuxerCoordinator? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
     // State tracking
     private var isRecording = false
     private var isPaused = false
     private var currentOutputFile: File? = null
-    private var tempVideoFile: File? = null
-    private var tempAudioFile: File? = null
 
     // Configuration
     private var videoWidth = 1280
@@ -317,7 +315,7 @@ class ScreenRecordService : Service() {
 
     @SuppressLint("WrongConstant")
     private fun startRecordingPipeline(resultCode: Int, resultData: Intent, densityDpi: Int) {
-        logDebug("PIPELINE", "Preparing output file for recording (${videoWidth}x${videoHeight})...")
+        logDebug("PIPELINE", "Preparing hardware MediaCodec + MediaMuxer pipeline (${videoWidth}x${videoHeight})...")
 
         // Prepare output directories
         val recordingsDir = File(getExternalFilesDir(null), "Recordings").apply {
@@ -335,89 +333,38 @@ class ScreenRecordService : Service() {
         ) == PackageManager.PERMISSION_GRANTED
 
         // Audio mode definitions:
-        // 1. MIC ONLY: MediaRecorder records directly from hardware MIC.
-        // 2. INTERNAL ONLY: MediaRecorder captures video surface; InternalAudioRecorder captures system playback (MIC MUTED).
-        // 3. BOTH: MediaRecorder captures video surface; InternalAudioRecorder captures and mixes playback + MIC.
+        // 1. MIC ONLY: VideoEncoderWrapper captures video surface; InternalAudioRecorder captures hardware MIC.
+        // 2. INTERNAL ONLY: VideoEncoderWrapper captures video surface; InternalAudioRecorder captures system playback (MIC MUTED).
+        // 3. BOTH: VideoEncoderWrapper captures video surface; InternalAudioRecorder mixes 70% playback + 30% MIC.
         // 4. MUTE: Video surface only, zero audio tracks.
         val isDirectMic = audioSourceType == AUDIO_SOURCE_MIC && hasMicPermission
         val isInternalAudio = (audioSourceType == AUDIO_SOURCE_INTERNAL || audioSourceType == AUDIO_SOURCE_BOTH)
+        val needsAudioCapture = isDirectMic || (isInternalAudio && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
 
-        val videoOutputFile = if (isInternalAudio) {
-            File(recordingsDir, "temp_video_${System.currentTimeMillis()}.mp4")
-        } else {
-            outputFile
-        }
-        tempVideoFile = videoOutputFile
+        // Initialize a single, real-time MediaMuxer coordinator for REC_<timestamp>.mp4
+        val expectedTrackCount = if (needsAudioCapture) 2 else 1
+        val coordinator = com.example.recorder.MuxerCoordinator(
+            outputFile = outputFile,
+            expectedTrackCount = expectedTrackCount
+        )
+        muxerCoordinator = coordinator
 
-        // Rule 3: MediaRecorder EXACT mandatory state-machine setup order
-        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            MediaRecorder(this)
-        } else {
-            @Suppress("DEPRECATION")
-            MediaRecorder()
-        }
-        mediaRecorder = recorder
-
-        // Attach listeners to detect unexpected hardware encoder events
-        recorder.setOnErrorListener { _, what, extra ->
-            Log.w(TAG, "MediaRecorder error callback: what=$what, extra=$extra (in-game audio/mic transition handled)")
-            // Do not immediately kill video recording if in-game voice chat or transient mic contention occurs
-        }
-        recorder.setOnInfoListener { _, what, extra ->
-            Log.i(TAG, "MediaRecorder info callback: what=$what, extra=$extra")
-            if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED ||
-                what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED
-            ) {
-                handleStopAndSave()
+        // 1. Initialize dedicated MediaCodec (H.264, CBR, 1s keyframe) streaming directly to MuxerCoordinator on 'VideoEncoderThread'
+        logDebug("CODEC_PREPARE", "Preparing VideoEncoderWrapper (H.264, CBR, 1s keyframe)...")
+        val encoder = com.example.recorder.VideoEncoderWrapper(
+            width = videoWidth,
+            height = videoHeight,
+            bitrate = videoBitrate,
+            fps = videoFps,
+            muxerCoordinator = coordinator,
+            onError = { errorMsg ->
+                logDebug("CODEC_ERROR", errorMsg, isError = true)
             }
-        }
+        )
+        val inputSurface = encoder.prepareAndStart()
+        videoEncoder = encoder
 
-        // 1. Audio Source (ONLY set on MediaRecorder when specifically recording direct Microphone)
-        if (isDirectMic) {
-            try {
-                recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
-            } catch (e: Exception) {
-                logDebug("AUDIO_WARN", "Cannot set audio source MIC: ${e.message}")
-            }
-        }
-
-        // 2. Video Source
-        recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
-
-        // 3. Output Format
-        recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-
-        // 4. Output File
-        recorder.setOutputFile(videoOutputFile.absolutePath)
-
-        // 5. Video Size
-        recorder.setVideoSize(videoWidth, videoHeight)
-
-        // 6. Video Encoder
-        recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-
-        // 7. Audio Encoder (Only for direct Microphone)
-        if (isDirectMic) {
-            try {
-                recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                recorder.setAudioSamplingRate(44100)
-                recorder.setAudioEncodingBitRate(128_000)
-            } catch (e: Exception) {
-                logDebug("AUDIO_ENCODER_WARN", "Audio encoder setup warning: ${e.message}")
-            }
-        }
-
-        // 8. Video Bitrate
-        recorder.setVideoEncodingBitRate(videoBitrate)
-
-        // 9. Video Frame Rate
-        recorder.setVideoFrameRate(videoFps)
-
-        // 10. Prepare
-        logDebug("PREPARE", "Preparing MediaRecorder...")
-        recorder.prepare()
-
-        // Acquire MediaProjection
+        // 2. Acquire MediaProjection
         logDebug("PROJECTION", "Acquiring MediaProjection...")
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val projection = projectionManager.getMediaProjection(resultCode, resultData)
@@ -434,39 +381,35 @@ class ScreenRecordService : Service() {
             }
         }, Handler(Looper.getMainLooper()))
 
-        // 11. Create VirtualDisplay attached to mediaRecorder surface
-        logDebug("VIRTUAL_DISPLAY", "Creating VirtualDisplay...")
+        // 3. Create VirtualDisplay attached directly to codec.createInputSurface()
+        logDebug("VIRTUAL_DISPLAY", "Creating VirtualDisplay with MediaCodec InputSurface...")
         virtualDisplay = projection.createVirtualDisplay(
             "ScreenRecordDisplay",
             videoWidth,
             videoHeight,
             densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            recorder.surface,
+            inputSurface,
             null,
             null
         )
 
-        // 12. Start MediaRecorder
-        logDebug("START", "Starting MediaRecorder...")
-        recorder.start()
-
-        // 13. Start Internal Audio Capture (or Both Game + Mic) if selected
-        if (isInternalAudio && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val audioFile = File(recordingsDir, "temp_audio_${System.currentTimeMillis()}.mp4")
-            tempAudioFile = audioFile
+        // 4. Start Audio Capture streaming AAC frames into the same MuxerCoordinator in real time
+        if (needsAudioCapture) {
             val recorderEngine = com.example.audio.InternalAudioRecorder(
                 context = this,
-                mediaProjection = projection,
-                outputFile = audioFile,
-                includeMic = (audioSourceType == AUDIO_SOURCE_BOTH)
+                mediaProjection = if (isInternalAudio) projection else null,
+                muxerCoordinator = coordinator,
+                includeMic = isDirectMic || (audioSourceType == AUDIO_SOURCE_BOTH),
+                includePlayback = isInternalAudio
             )
             val audioStarted = recorderEngine.start()
             if (audioStarted) {
                 internalAudioRecorder = recorderEngine
-                logDebug("INTERNAL_AUDIO", "Internal audio capture started (includeMic=${audioSourceType == AUDIO_SOURCE_BOTH})")
+                logDebug("AUDIO_CAPTURE", "Audio capture started (playback=$isInternalAudio, mic=${isDirectMic || audioSourceType == AUDIO_SOURCE_BOTH})")
             } else {
-                logDebug("INTERNAL_AUDIO_WARN", "Internal audio capture could not start, video only")
+                coordinator.onAudioTrackUnavailable()
+                logDebug("AUDIO_CAPTURE_WARN", "Audio capture could not start, proceeding with video only")
             }
         }
 
@@ -479,7 +422,7 @@ class ScreenRecordService : Service() {
             elapsedSeconds = 0,
             isMicEnabled = isDirectMic || audioSourceType == AUDIO_SOURCE_BOTH,
             diagnostic = DiagnosticInfo(
-                lastLogMessage = "Recording Active: ${videoWidth}x${videoHeight} @ ${videoFps}fps",
+                lastLogMessage = "Recording Active: ${videoWidth}x${videoHeight} @ ${videoFps}fps (H.264 MediaCodec)",
                 step = "RECORDING",
                 filePath = outputFile.absolutePath,
                 fileSizeBytes = 0L,
@@ -526,9 +469,8 @@ class ScreenRecordService : Service() {
     private fun handlePause() {
         if (!isRecording || isPaused) return
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                mediaRecorder?.pause()
-            }
+            videoEncoder?.pause()
+            internalAudioRecorder?.isPaused = true
             isPaused = true
             floatingOverlay?.setPaused(true)
             _serviceStatus.value = _serviceStatus.value.copy(state = RecordingState.PAUSED)
@@ -542,9 +484,8 @@ class ScreenRecordService : Service() {
     private fun handleResume() {
         if (!isRecording || !isPaused) return
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                mediaRecorder?.resume()
-            }
+            videoEncoder?.resume()
+            internalAudioRecorder?.isPaused = false
             isPaused = false
             floatingOverlay?.setPaused(false)
             _serviceStatus.value = _serviceStatus.value.copy(state = RecordingState.RECORDING)
@@ -581,25 +522,14 @@ class ScreenRecordService : Service() {
             // Ensure at least minimum frames are flushed to hardware surface
             delay(250)
 
-            // 1. Stop and release MediaRecorder FIRST while VirtualDisplay surface is still active!
-            // CRITICAL: Releasing VirtualDisplay before MediaRecorder causes native MediaRecorder::stop()
-            // to throw RuntimeException: stop failed (-1007), corrupting the MP4 header/moov atom.
+            // 1. Signal EOS and release VideoEncoderWrapper FIRST while VirtualDisplay surface is still active!
             try {
-                mediaRecorder?.stop()
-                logDebug("RECORDER_STOP", "MediaRecorder stopped successfully")
+                videoEncoder?.stopAndRelease()
+                logDebug("ENCODER_STOP", "VideoEncoderWrapper stopped and flushed successfully")
             } catch (e: Exception) {
-                logDebug("RECORDER_STOP_ERROR", "MediaRecorder stop: ${e.message}", isError = true, exception = e)
+                logDebug("ENCODER_STOP_ERROR", "VideoEncoderWrapper stop: ${e.message}", isError = true, exception = e)
             }
-
-            try {
-                mediaRecorder?.reset()
-            } catch (_: Exception) {}
-            try {
-                mediaRecorder?.release()
-            } catch (e: Exception) {
-                Log.w(TAG, "MediaRecorder release: ${e.message}")
-            }
-            mediaRecorder = null
+            videoEncoder = null
 
             // 2. Now safely release VirtualDisplay
             try {
@@ -617,7 +547,7 @@ class ScreenRecordService : Service() {
             }
             mediaProjection = null
 
-            // 4. Stop and release InternalAudioRecorder
+            // 4. Stop and release InternalAudioRecorder so all remaining AAC frames flush to MuxerCoordinator
             try {
                 internalAudioRecorder?.stop()
             } catch (e: Exception) {
@@ -625,36 +555,16 @@ class ScreenRecordService : Service() {
             }
             internalAudioRecorder = null
 
-            val outputFile = currentOutputFile
-
-            // 5. Merge video and internal audio tracks if applicable
-            val vidFile = tempVideoFile
-            val audFile = tempAudioFile
-            if (outputFile != null && vidFile != null && vidFile != outputFile && vidFile.exists() && vidFile.length() > 0L) {
-                var mergedSuccess = false
-                if (audFile != null && audFile.exists() && audFile.length() > 2048L) {
-                    logDebug("MERGE", "Merging audio track into output MP4...")
-                    mergedSuccess = com.example.recorder.AudioMuxerHelper.mergeVideoAndAudio(vidFile, audFile, outputFile)
-                }
-
-                // If merge was not possible, failed, or audio was missing/empty, preserve raw video directly!
-                if (!mergedSuccess || !outputFile.exists() || outputFile.length() <= 0L) {
-                    logDebug("DIRECT_COPY", "Preserving video file directly into output MP4...")
-                    try {
-                        vidFile.copyTo(outputFile, overwrite = true)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error copying vidFile to outputFile: ${e.message}")
-                    }
-                }
-
-                // Only delete temp files once outputFile is confirmed written
-                if (outputFile.exists() && outputFile.length() > 0L) {
-                    try { vidFile.delete() } catch (_: Exception) {}
-                    try { audFile?.delete() } catch (_: Exception) {}
-                }
-                tempVideoFile = null
-                tempAudioFile = null
+            // 5. Stop and release the shared real-time MediaMuxer coordinator
+            try {
+                muxerCoordinator?.stopAndRelease()
+                logDebug("MUXER_STOP", "Real-time MediaMuxer finalized cleanly")
+            } catch (e: Exception) {
+                logDebug("MUXER_STOP_ERROR", "MuxerCoordinator stop: ${e.message}", isError = true, exception = e)
             }
+            muxerCoordinator = null
+
+            val outputFile = currentOutputFile
 
             // 6. Release WakeLock & stop thermal monitor
             try {
@@ -1012,15 +922,11 @@ class ScreenRecordService : Service() {
         if (isRecording) {
             Log.i(TAG, "onDestroy called while recording: performing emergency finalization")
             try {
-                // Must stop MediaRecorder before releasing VirtualDisplay to avoid native crash
+                // Stop and flush VideoEncoderWrapper before releasing VirtualDisplay
                 try {
-                    mediaRecorder?.stop()
+                    videoEncoder?.stopAndRelease()
                 } catch (_: Exception) {}
-                try {
-                    mediaRecorder?.reset()
-                    mediaRecorder?.release()
-                } catch (_: Exception) {}
-                mediaRecorder = null
+                videoEncoder = null
 
                 virtualDisplay?.release()
                 virtualDisplay = null
@@ -1031,6 +937,11 @@ class ScreenRecordService : Service() {
                     internalAudioRecorder?.stop()
                 } catch (_: Exception) {}
                 internalAudioRecorder = null
+
+                try {
+                    muxerCoordinator?.stopAndRelease()
+                } catch (_: Exception) {}
+                muxerCoordinator = null
 
                 if (wakeLock?.isHeld == true) {
                     wakeLock?.release()

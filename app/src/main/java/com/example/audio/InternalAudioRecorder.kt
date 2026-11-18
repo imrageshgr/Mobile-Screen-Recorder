@@ -32,10 +32,12 @@ import java.nio.ByteOrder
  */
 class InternalAudioRecorder(
     private val context: Context,
-    private val mediaProjection: MediaProjection,
-    private val outputFile: File,
+    private val mediaProjection: MediaProjection?,
+    private val outputFile: File? = null,
+    private val muxerCoordinator: com.example.recorder.MuxerCoordinator? = null,
     private val includeMic: Boolean = false,
     private val includeVoiceChat: Boolean = true,
+    private val includePlayback: Boolean = true,
     private val sampleRate: Int = 44100,
     private val audioBitrate: Int = 128000
 ) {
@@ -58,13 +60,16 @@ class InternalAudioRecorder(
     var isMicMuted: Boolean = false
 
     @Volatile
+    var isPaused: Boolean = false
+
+    @Volatile
     private var isRunning = false
     private var workerThread: Thread? = null
     private val lock = Any()
 
     @SuppressLint("MissingPermission")
     fun start(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+        if (includePlayback && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             Log.w(TAG, "AudioPlaybackCapture requires Android 10+ (API 29+)")
             return false
         }
@@ -73,41 +78,47 @@ class InternalAudioRecorder(
             if (isRunning) return true
 
             try {
-                // 1. Configure Internal Audio Playback Capture (Media, Game & Teammates' in-game Voice Chat)
-                val playbackConfigBuilder = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-
-                if (includeVoiceChat) {
-                    // Captures VoIP voice communication so teammates' in-game voice chat is captured
-                    playbackConfigBuilder.addMatchingUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    playbackConfigBuilder.addMatchingUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING)
-                }
-                val playbackConfig = playbackConfigBuilder.build()
-
                 val minBufSize = AudioRecord.getMinBufferSize(sampleRate, CHANNEL_CONFIG, AUDIO_FORMAT)
                 val bufferSize = (minBufSize * 4).coerceAtLeast(16384)
 
-                val audioFormat = AudioFormat.Builder()
-                    .setEncoding(AUDIO_FORMAT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(CHANNEL_CONFIG)
-                    .build()
+                // 1. Configure Internal Audio Playback Capture (Media, Game & Teammates' in-game Voice Chat)
+                if (includePlayback && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && mediaProjection != null) {
+                    val playbackConfigBuilder = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
+                        .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                        .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                        .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
 
-                playbackRecord = AudioRecord.Builder()
-                    .setAudioPlaybackCaptureConfig(playbackConfig)
-                    .setAudioFormat(audioFormat)
-                    .setBufferSizeInBytes(bufferSize)
-                    .build()
+                    if (includeVoiceChat) {
+                        // Captures VoIP voice communication so teammates' in-game voice chat is captured
+                        playbackConfigBuilder.addMatchingUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        playbackConfigBuilder.addMatchingUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING)
+                    }
+                    val playbackConfig = playbackConfigBuilder.build()
 
-                if (playbackRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                    Log.e(TAG, "Failed to initialize playback AudioRecord")
-                    release()
-                    return false
+                    val audioFormat = AudioFormat.Builder()
+                        .setEncoding(AUDIO_FORMAT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(CHANNEL_CONFIG)
+                        .build()
+
+                    playbackRecord = AudioRecord.Builder()
+                        .setAudioPlaybackCaptureConfig(playbackConfig)
+                        .setAudioFormat(audioFormat)
+                        .setBufferSizeInBytes(bufferSize)
+                        .build()
+
+                    if (playbackRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                        Log.e(TAG, "Failed to initialize playback AudioRecord")
+                        playbackRecord?.release()
+                        playbackRecord = null
+                        if (!includeMic) {
+                            release()
+                            return false
+                        }
+                    }
                 }
 
-                // 2. If Both Audio (Game + Mic) requested, configure Microphone AudioRecord
+                // 2. If Microphone requested (BOTH or MIC-only), configure Microphone AudioRecord
                 if (includeMic) {
                     val hasMicPermission = ContextCompat.checkSelfPermission(
                         context,
@@ -124,7 +135,7 @@ class InternalAudioRecorder(
                                 bufferSize
                             )
                             if (micRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                                Log.w(TAG, "Failed to initialize mic AudioRecord, falling back to game-only")
+                                Log.w(TAG, "Failed to initialize mic AudioRecord")
                                 micRecord?.release()
                                 micRecord = null
                             }
@@ -133,6 +144,12 @@ class InternalAudioRecorder(
                             micRecord = null
                         }
                     }
+                }
+
+                if (playbackRecord == null && micRecord == null) {
+                    Log.w(TAG, "No audio capture source could be initialized")
+                    release()
+                    return false
                 }
 
                 // 3. Configure MediaCodec AAC Audio Encoder
@@ -151,8 +168,12 @@ class InternalAudioRecorder(
                 codec.start()
                 audioCodec = codec
 
-                // 4. Configure MediaMuxer
-                mediaMuxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                // 4. Configure standalone MediaMuxer only when no shared MuxerCoordinator is attached
+                if (muxerCoordinator == null) {
+                    val targetFile = outputFile
+                        ?: throw IllegalArgumentException("Either outputFile or muxerCoordinator must be provided")
+                    mediaMuxer = MediaMuxer(targetFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                }
 
                 // 5. Start AudioRecord streams
                 playbackRecord?.startRecording()
@@ -168,7 +189,7 @@ class InternalAudioRecorder(
                     start()
                 }
 
-                Log.d(TAG, "InternalAudioRecorder started (includeMic=$includeMic, sampleRate=$sampleRate)")
+                Log.d(TAG, "InternalAudioRecorder started (includePlayback=$includePlayback, includeMic=$includeMic, sampleRate=$sampleRate)")
                 return true
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start InternalAudioRecorder: ${e.message}", e)
@@ -180,8 +201,9 @@ class InternalAudioRecorder(
 
     private fun recordLoop(bufferSize: Int) {
         val codec = audioCodec ?: return
-        val playback = playbackRecord ?: return
+        val playback = playbackRecord
         val mic = micRecord
+        if (playback == null && mic == null) return
 
         val pcmChunkShorts = 1024 * CHANNEL_COUNT
         val playBuf = ShortArray(pcmChunkShorts)
@@ -193,13 +215,15 @@ class InternalAudioRecorder(
         var presentationTimeUs = 0L
 
         while (isRunning) {
-            var playRead = try {
-                val r = playback.read(playBuf, 0, pcmChunkShorts)
-                if (r > 0) r else 0
-            } catch (e: Exception) {
-                Log.w(TAG, "AudioPlayback read exception: ${e.message}")
-                0
-            }
+            var playRead = if (playback != null) {
+                try {
+                    val r = playback.read(playBuf, 0, pcmChunkShorts)
+                    if (r > 0) r else 0
+                } catch (e: Exception) {
+                    Log.w(TAG, "AudioPlayback read exception: ${e.message}")
+                    0
+                }
+            } else 0
 
             val micRead = if (mic != null && micBuf != null && !isMicMuted) {
                 try {
@@ -212,7 +236,12 @@ class InternalAudioRecorder(
                 }
             } else 0
 
-            // If playback returned nothing or silence (e.g. game in menu or muted), fill with silence to keep audio pacing
+            if (isPaused) {
+                try { Thread.sleep(20) } catch (_: Exception) {}
+                continue
+            }
+
+            // If playback returned nothing or silence (e.g. game in menu, muted, or mic-only), adjust length
             if (playRead <= 0) {
                 if (micRead > 0 && micBuf != null) {
                     playRead = micRead
@@ -224,16 +253,22 @@ class InternalAudioRecorder(
                 }
             }
 
-            // Mix or copy PCM samples
+            // Mix or copy PCM samples (70% game audio, 30% microphone to prevent clipping)
             pcmByteBuffer.clear()
             if (micRead > 0 && micBuf != null) {
-                for (i in 0 until playRead) {
-                    val pSample = playBuf[i].toInt()
-                    val mSample = micBuf[i].toInt()
-                    val mixed = (pSample + mSample).coerceIn(-32768, 32767).toShort()
-                    mixBuf[i] = mixed
+                if (playback == null) {
+                    // Mic-only recording: write microphone samples at full clarity
+                    pcmByteBuffer.asShortBuffer().put(micBuf, 0, micRead)
+                    playRead = micRead
+                } else {
+                    for (i in 0 until playRead) {
+                        val pSample = playBuf[i].toInt()
+                        val mSample = if (i < micRead) micBuf[i].toInt() else 0
+                        val mixed = ((pSample * 0.7) + (mSample * 0.3)).toInt().coerceIn(-32768, 32767).toShort()
+                        mixBuf[i] = mixed
+                    }
+                    pcmByteBuffer.asShortBuffer().put(mixBuf, 0, playRead)
                 }
-                pcmByteBuffer.asShortBuffer().put(mixBuf, 0, playRead)
             } else {
                 pcmByteBuffer.asShortBuffer().put(playBuf, 0, playRead)
             }
@@ -278,7 +313,9 @@ class InternalAudioRecorder(
     }
 
     private fun drainEncoder(codec: MediaCodec, bufferInfo: MediaCodec.BufferInfo, endOfStream: Boolean) {
-        val muxer = mediaMuxer ?: return
+        val coordinator = muxerCoordinator
+        val muxer = mediaMuxer
+        if (coordinator == null && muxer == null) return
 
         while (true) {
             val outputIndex = codec.dequeueOutputBuffer(bufferInfo, TIMEOUT_USEC)
@@ -287,18 +324,26 @@ class InternalAudioRecorder(
                     if (!endOfStream) break else continue
                 }
                 outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    if (!isMuxerStarted) {
-                        val newFormat = codec.outputFormat
+                    val newFormat = codec.outputFormat
+                    if (coordinator != null) {
+                        coordinator.setAudioFormat(newFormat)
+                        Log.d(TAG, "Audio format registered on real-time MuxerCoordinator")
+                    } else if (muxer != null && !isMuxerStarted) {
                         audioTrackIndex = muxer.addTrack(newFormat)
                         muxer.start()
                         isMuxerStarted = true
-                        Log.d(TAG, "Audio MediaMuxer started with track index: $audioTrackIndex")
+                        Log.d(TAG, "Standalone Audio MediaMuxer started with track index: $audioTrackIndex")
                     }
                 }
                 outputIndex >= 0 -> {
                     val encodedBuffer = codec.getOutputBuffer(outputIndex)
-                    if (encodedBuffer != null && bufferInfo.size > 0 && isMuxerStarted) {
-                        muxer.writeSampleData(audioTrackIndex, encodedBuffer, bufferInfo)
+                    val isCodecConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                    if (encodedBuffer != null && bufferInfo.size > 0 && !isCodecConfig) {
+                        if (coordinator != null) {
+                            coordinator.writeAudioSample(encodedBuffer, bufferInfo)
+                        } else if (muxer != null && isMuxerStarted) {
+                            muxer.writeSampleData(audioTrackIndex, encodedBuffer, bufferInfo)
+                        }
                     }
                     codec.releaseOutputBuffer(outputIndex, false)
 
@@ -324,7 +369,7 @@ class InternalAudioRecorder(
         } catch (_: Exception) {}
 
         release()
-        Log.d(TAG, "InternalAudioRecorder stopped, saved: ${outputFile.length()} bytes")
+        Log.d(TAG, "InternalAudioRecorder stopped")
     }
 
     private fun release() {

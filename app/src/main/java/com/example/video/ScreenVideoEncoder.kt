@@ -26,6 +26,9 @@ class ScreenVideoEncoder(
     companion object {
         private const val TAG = "ScreenVideoEncoder"
         private const val TIMEOUT_USEC = 10_000L
+        private const val SMART_BITRATE_CAP_BPS = 12_000_000
+        private const val BITRATE_1080P_60FPS_BPS = 12_000_000
+        private const val I_FRAME_INTERVAL_SECONDS = 1
     }
 
     private val encoderScope = CoroutineScope(Dispatchers.IO + Job())
@@ -49,20 +52,39 @@ class ScreenVideoEncoder(
         val evenWidth = (width / 2) * 2
         val evenHeight = (height / 2) * 2
 
+        val is1080p = maxOf(evenWidth, evenHeight) >= 1920 && minOf(evenWidth, evenHeight) >= 1080
+        val effectiveBitrate = if (is1080p && frameRate >= 60) {
+            BITRATE_1080P_60FPS_BPS
+        } else {
+            bitrate.coerceAtMost(SMART_BITRATE_CAP_BPS)
+        }
+
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, evenWidth, evenHeight).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+            setInteger(MediaFormat.KEY_BIT_RATE, effectiveBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL_SECONDS)
+            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
         }
 
-        videoCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            inputSurface = createInputSurface()
-            start()
+        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        try {
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        } catch (e: MediaCodec.CodecException) {
+            Log.w(TAG, "CBR configuration unsupported on this chipset, falling back to default bitrate mode: ${e.message}")
+            val fallbackFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, evenWidth, evenHeight).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, effectiveBitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL_SECONDS)
+            }
+            codec.configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         }
+        inputSurface = codec.createInputSurface()
+        codec.start()
+        videoCodec = codec
 
-        Log.d(TAG, "ScreenVideoEncoder prepared (${evenWidth}x${evenHeight} @ ${frameRate}fps, ${bitrate}bps)")
+        Log.d(TAG, "ScreenVideoEncoder prepared (${evenWidth}x${evenHeight} @ ${frameRate}fps, ${effectiveBitrate}bps CBR)")
         return inputSurface ?: throw IllegalStateException("Failed to create encoder input surface")
     }
 
@@ -95,49 +117,67 @@ class ScreenVideoEncoder(
                         }
                     }
                     outputIndex >= 0 -> {
-                        val encodedBuffer = codec.getOutputBuffer(outputIndex)
-                        val isEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                        var bufferReleased = false
+                        var isEos = false
+                        try {
+                            val encodedBuffer = codec.getOutputBuffer(outputIndex)
+                            isEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
 
-                        if (encodedBuffer != null && bufferInfo.size > 0 && videoTrackIndex >= 0) {
-                            val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                            if (encodedBuffer != null && bufferInfo.size > 0 && videoTrackIndex >= 0) {
+                                val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
 
-                            // 1. Mandatory keyframe requirement on initial recording start
-                            if (!hasWrittenFirstKeyFrame) {
-                                if (isKeyFrame) {
-                                    hasWrittenFirstKeyFrame = true
-                                    Log.d(TAG, "First keyframe received! Commencing muxer writes.")
-                                } else {
-                                    Log.d(TAG, "Dropping leading non-keyframe; requesting sync frame.")
-                                    requestSyncFrame()
-                                    codec.releaseOutputBuffer(outputIndex, false)
-                                    continue
+                                // 1. Mandatory keyframe requirement on initial recording start
+                                if (!hasWrittenFirstKeyFrame) {
+                                    if (isKeyFrame) {
+                                        hasWrittenFirstKeyFrame = true
+                                        Log.d(TAG, "First keyframe received! Commencing muxer writes.")
+                                    } else {
+                                        Log.d(TAG, "Dropping leading non-keyframe; requesting sync frame.")
+                                        requestSyncFrame()
+                                        codec.releaseOutputBuffer(outputIndex, false)
+                                        bufferReleased = true
+                                        continue
+                                    }
+                                }
+
+                                // 2. Mandatory keyframe requirement after resuming from pause to prevent green/corrupt artifacts
+                                if (needsSyncFrameAfterResume) {
+                                    if (isKeyFrame) {
+                                        needsSyncFrameAfterResume = false
+                                        Log.d(TAG, "New keyframe received after resume. Resuming muxer writes.")
+                                    } else {
+                                        Log.d(TAG, "Dropping non-keyframe post-resume; waiting for keyframe.")
+                                        requestSyncFrame()
+                                        codec.releaseOutputBuffer(outputIndex, false)
+                                        bufferReleased = true
+                                        continue
+                                    }
+                                }
+
+                                // Write sample data only when active (not paused)
+                                if (!clock.isPaused()) {
+                                    bufferInfo.presentationTimeUs = clock.getAdjustedVideoPtsUs(bufferInfo.presentationTimeUs)
+
+                                    encodedBuffer.position(bufferInfo.offset)
+                                    encodedBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                                    muxer.writeSampleData(videoTrackIndex, encodedBuffer, bufferInfo)
                                 }
                             }
-
-                            // 2. Mandatory keyframe requirement after resuming from pause to prevent green/corrupt artifacts
-                            if (needsSyncFrameAfterResume) {
-                                if (isKeyFrame) {
-                                    needsSyncFrameAfterResume = false
-                                    Log.d(TAG, "New keyframe received after resume. Resuming muxer writes.")
-                                } else {
-                                    Log.d(TAG, "Dropping non-keyframe post-resume; waiting for keyframe.")
-                                    requestSyncFrame()
+                        } catch (e: IllegalStateException) {
+                            Log.w(TAG, "MediaCodec IllegalStateException (buffer overflow); safely dropping frame index=$outputIndex: ${e.message}")
+                            try {
+                                codec.releaseOutputBuffer(outputIndex, false)
+                                bufferReleased = true
+                            } catch (_: Exception) {}
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Error draining video frame: ${e.message}")
+                        } finally {
+                            if (!bufferReleased) {
+                                try {
                                     codec.releaseOutputBuffer(outputIndex, false)
-                                    continue
-                                }
-                            }
-
-                            // Write sample data only when active (not paused)
-                            if (!clock.isPaused()) {
-                                bufferInfo.presentationTimeUs = clock.getAdjustedVideoPtsUs(bufferInfo.presentationTimeUs)
-
-                                encodedBuffer.position(bufferInfo.offset)
-                                encodedBuffer.limit(bufferInfo.offset + bufferInfo.size)
-                                muxer.writeSampleData(videoTrackIndex, encodedBuffer, bufferInfo)
+                                } catch (_: Exception) {}
                             }
                         }
-
-                        codec.releaseOutputBuffer(outputIndex, false)
 
                         if (isEos) {
                             Log.d(TAG, "Video encoder reached BUFFER_FLAG_END_OF_STREAM")
