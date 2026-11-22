@@ -88,11 +88,6 @@ class ScreenRecordService : Service() {
         const val EXTRA_ORIENTATION = "extra_orientation"
         const val EXTRA_ENABLE_FLOATING = "extra_enable_floating"
         const val EXTRA_SHORT_CLIP_SECONDS = "extra_short_clip_seconds"
-        const val EXTRA_IS_LIVE_STREAM = "extra_is_live_stream"
-        const val EXTRA_STREAM_URL = "extra_stream_url"
-        const val EXTRA_STREAM_KEY = "extra_stream_key"
-        const val EXTRA_STREAM_DELAY_SECONDS = "extra_stream_delay_seconds"
-        const val EXTRA_AUDIO_MODE = "extra_audio_mode"
 
         const val AUDIO_SOURCE_INTERNAL = "INTERNAL"
         const val AUDIO_SOURCE_MIC = "MIC"

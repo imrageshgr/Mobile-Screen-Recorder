@@ -59,8 +59,10 @@ import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VideoLibrary
 import android.os.PowerManager
+import androidx.compose.animation.animateContentSize
 import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.ScreenRotation
+import androidx.compose.material.icons.filled.SportsEsports
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material.icons.filled.VolumeOff
@@ -128,7 +130,6 @@ import com.example.ui.theme.LightBorderGray
 import com.example.ui.theme.LightSurface
 import com.example.ui.theme.PureBlack
 import com.example.ui.theme.PureWhite
-import com.example.ui.screens.LiveTabScreen
 import com.example.ui.theme.ScreenCapTheme
 import com.example.viewmodel.MainViewModel
 
@@ -220,6 +221,8 @@ class MainActivity : ComponentActivity() {
             val selectedResolution by viewModel.selectedResolution.collectAsState()
             val selectedFps by viewModel.selectedFps.collectAsState()
             val selectedBitrate by viewModel.selectedBitrate.collectAsState()
+            val recordingMode by viewModel.recordingMode.collectAsState()
+            val availableAudioSources by viewModel.availableAudioSources.collectAsState()
             val selectedAudioSource by viewModel.selectedAudioSource.collectAsState()
             val selectedOrientation by viewModel.selectedOrientation.collectAsState()
             val isFloatingButtonEnabled by viewModel.isFloatingButtonEnabled.collectAsState()
@@ -243,9 +246,6 @@ class MainActivity : ComponentActivity() {
             val isAnalyzing by viewModel.isAnalyzing.collectAsState()
             val analysisProgress by viewModel.analysisProgress.collectAsState()
             val deviceProfile by viewModel.deviceProfile.collectAsState()
-
-            val liveStreamConfig by viewModel.liveStreamConfig.collectAsState()
-            val liveStreamHistory by viewModel.liveStreamHistory.collectAsState()
 
             val thermalStatus by viewModel.thermalStatus.collectAsState()
             val showOverheatStopPrompt by viewModel.showOverheatStopPrompt.collectAsState()
@@ -308,9 +308,14 @@ class MainActivity : ComponentActivity() {
                                 serviceStatus = serviceStatus,
                                 resolution = selectedResolution,
                                 fps = selectedFps,
+                                recordingMode = recordingMode,
+                                availableAudioSources = availableAudioSources,
                                 audioSource = selectedAudioSource,
                                 isBatteryOptIgnored = isBatteryOptIgnored,
                                 shortClipDurationSeconds = shortClipDurationSeconds,
+                                onRecordingModeSelected = { mode ->
+                                    viewModel.setRecordingMode(mode)
+                                },
                                 onAudioSourceSelected = { source ->
                                     if (source != ScreenRecordService.AUDIO_SOURCE_MUTE) {
                                         if (ContextCompat.checkSelfPermission(
@@ -372,7 +377,7 @@ class MainActivity : ComponentActivity() {
                                     viewModel.takeShortClip(this@MainActivity)
                                     Toast.makeText(this@MainActivity, "Saving ${shortClipDurationSeconds}s short clip to ShortClips folder...", Toast.LENGTH_SHORT).show()
                                 },
-                                onGoToSettings = { viewModel.setTab(4) }
+                                onGoToSettings = { viewModel.setTab(3) }
                             )
                             1 -> RecordingsTabScreen(
                                 recordings = recentRecordings,
@@ -417,40 +422,9 @@ class MainActivity : ComponentActivity() {
                                 onOpenDriveAppClick = { openGoogleDriveApp(this@MainActivity) },
                                 onRefreshClick = { viewModel.refreshRecordings() }
                             )
-                            3 -> LiveTabScreen(
-                                config = liveStreamConfig,
-                                resolution = selectedResolution,
-                                fps = selectedFps,
-                                bitrate = selectedBitrate,
-                                onConfigChange = { viewModel.updateLiveStreamConfig(it) },
-                                onStartLiveStream = {
-                                    val isRecording = serviceStatus.state == RecordingState.RECORDING ||
-                                            serviceStatus.state == RecordingState.PAUSED
-                                    if (!isRecording) {
-                                        // Record broadcast session into permanent history
-                                        viewModel.recordLiveStreamSession(
-                                            resolution = selectedResolution,
-                                            fps = selectedFps,
-                                            bitrate = selectedBitrate
-                                        )
-                                        Toast.makeText(this@MainActivity, "Launching live broadcast to ${liveStreamConfig.platform}...", Toast.LENGTH_SHORT).show()
-                                        val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                                            mediaProjectionManager.createScreenCaptureIntent(
-                                                android.media.projection.MediaProjectionConfig.createConfigForDefaultDisplay()
-                                            )
-                                        } else {
-                                            mediaProjectionManager.createScreenCaptureIntent()
-                                        }
-                                        projectionLauncher.launch(captureIntent)
-                                    } else {
-                                        Toast.makeText(this@MainActivity, "Screen recording or broadcast is already active.", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            )
-                            4 -> SettingsTabScreen(
+                            3 -> SettingsTabScreen(
                                 deviceProfile = deviceProfile,
                                 thermalStatus = thermalStatus,
-                                liveStreamHistory = liveStreamHistory,
                                 themeMode = themeMode,
                                 resolution = selectedResolution,
                                 fps = selectedFps,
@@ -777,31 +751,11 @@ private fun GamingBottomNavigation(
             onClick = { onTabSelected(3) },
             icon = {
                 Icon(
-                    painter = painterResource(id = R.drawable.ic_live_broadcast),
-                    contentDescription = "Live Tab",
-                    modifier = Modifier.size(22.dp)
-                )
-            },
-            label = { Text("Live", fontWeight = if (currentTab == 3) FontWeight.Bold else FontWeight.Normal) },
-            colors = NavigationBarItemDefaults.colors(
-                selectedIconColor = MaterialTheme.colorScheme.surface,
-                selectedTextColor = MaterialTheme.colorScheme.onSurface,
-                indicatorColor = MaterialTheme.colorScheme.onSurface,
-                unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        )
-
-        NavigationBarItem(
-            selected = currentTab == 4,
-            onClick = { onTabSelected(4) },
-            icon = {
-                Icon(
                     imageVector = Icons.Filled.Settings,
                     contentDescription = "Settings Tab"
                 )
             },
-            label = { Text("Settings", fontWeight = if (currentTab == 4) FontWeight.Bold else FontWeight.Normal) },
+            label = { Text("Settings", fontWeight = if (currentTab == 3) FontWeight.Bold else FontWeight.Normal) },
             colors = NavigationBarItemDefaults.colors(
                 selectedIconColor = MaterialTheme.colorScheme.surface,
                 selectedTextColor = MaterialTheme.colorScheme.onSurface,
@@ -818,9 +772,12 @@ private fun RecordTabScreen(
     serviceStatus: com.example.model.ServiceStatus,
     resolution: String,
     fps: Int,
+    recordingMode: String,
+    availableAudioSources: List<String>,
     audioSource: String,
     isBatteryOptIgnored: Boolean,
     shortClipDurationSeconds: Int,
+    onRecordingModeSelected: (String) -> Unit,
     onAudioSourceSelected: (String) -> Unit,
     onRequestIgnoreBatteryOpt: () -> Unit,
     onStartRecordClick: () -> Unit,
@@ -969,54 +926,90 @@ private fun RecordTabScreen(
         }
 
 
-        // Audio Source Selection Card
+        // Recording Mode Selector Card (Normal vs Game)
+        item {
+            SettingCard(title = "Recording Mode", icon = Icons.Filled.SportsEsports) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    SegmentButton(
+                        text = "Normal Mode",
+                        icon = Icons.Filled.Videocam,
+                        selected = recordingMode == MainViewModel.MODE_NORMAL,
+                        onClick = { onRecordingModeSelected(MainViewModel.MODE_NORMAL) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("recording_mode_normal_button")
+                    )
+                    SegmentButton(
+                        text = "Game Mode",
+                        icon = Icons.Filled.SportsEsports,
+                        selected = recordingMode == MainViewModel.MODE_GAME,
+                        onClick = { onRecordingModeSelected(MainViewModel.MODE_GAME) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("recording_mode_game_button")
+                    )
+                }
+                Text(
+                    text = if (recordingMode == MainViewModel.MODE_NORMAL) {
+                        "Streamlined for tutorials, apps, and everyday captures with Internal or Internal + Mic audio."
+                    } else {
+                        "Full gaming capture suite with Mute, Internal Game, Game + Mic (70/30 mix), and Mic-only options."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        // Dynamic Audio Source Selection Card (Adapts to Recording Mode)
         item {
             SettingCard(title = "Audio Source", icon = Icons.Filled.VolumeUp) {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        SegmentButton(
-                            text = "Internal Game",
-                            icon = Icons.Filled.VolumeUp,
-                            selected = audioSource == ScreenRecordService.AUDIO_SOURCE_INTERNAL,
-                            onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_INTERNAL) },
-                            modifier = Modifier.weight(1f)
-                        )
-                        SegmentButton(
-                            text = "Microphone",
-                            icon = Icons.Filled.Mic,
-                            selected = audioSource == ScreenRecordService.AUDIO_SOURCE_MIC,
-                            onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_MIC) },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        SegmentButton(
-                            text = "Game + Mic (Both)",
-                            icon = Icons.Filled.VolumeUp,
-                            selected = audioSource == ScreenRecordService.AUDIO_SOURCE_BOTH,
-                            onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_BOTH) },
-                            modifier = Modifier.weight(1f)
-                        )
-                        SegmentButton(
-                            text = "Mute",
-                            icon = Icons.Filled.VolumeOff,
-                            selected = audioSource == ScreenRecordService.AUDIO_SOURCE_MUTE,
-                            onClick = { onAudioSourceSelected(ScreenRecordService.AUDIO_SOURCE_MUTE) },
-                            modifier = Modifier.weight(1f)
-                        )
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .animateContentSize(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    availableAudioSources.chunked(2).forEach { rowSources ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            rowSources.forEach { source ->
+                                val (label, icon) = when (source) {
+                                    ScreenRecordService.AUDIO_SOURCE_INTERNAL ->
+                                        (if (recordingMode == MainViewModel.MODE_GAME) "Internal Game" else "Internal Audio") to Icons.Filled.VolumeUp
+                                    ScreenRecordService.AUDIO_SOURCE_BOTH ->
+                                        (if (recordingMode == MainViewModel.MODE_GAME) "Game + Mic" else "Internal + Mic") to Icons.Filled.VolumeUp
+                                    ScreenRecordService.AUDIO_SOURCE_MIC ->
+                                        "Microphone" to Icons.Filled.Mic
+                                    else ->
+                                        "Mute" to Icons.Filled.VolumeOff
+                                }
+                                SegmentButton(
+                                    text = label,
+                                    icon = icon,
+                                    selected = audioSource == source,
+                                    onClick = { onAudioSourceSelected(source) },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("audio_source_${source.lowercase()}_button")
+                                )
+                            }
+                            if (rowSources.size == 1) {
+                                Spacer(modifier = Modifier.weight(1f))
+                            }
+                        }
                     }
                 }
                 Text(
                     text = when (audioSource) {
-                        ScreenRecordService.AUDIO_SOURCE_INTERNAL -> "Captures game sound directly with zero background noise. Microphone is completely muted so your talking voice is NOT recorded."
-                        ScreenRecordService.AUDIO_SOURCE_MIC -> "Records microphone audio with voice commentary only. Internal game sound is not captured."
-                        ScreenRecordService.AUDIO_SOURCE_BOTH -> "Captures internal game sound AND your microphone voice commentary simultaneously."
+                        ScreenRecordService.AUDIO_SOURCE_INTERNAL -> "Captures internal audio directly with zero background noise. Microphone is muted."
+                        ScreenRecordService.AUDIO_SOURCE_MIC -> "Records microphone audio with voice commentary only. Internal sound is not captured."
+                        ScreenRecordService.AUDIO_SOURCE_BOTH -> "Captures internal audio (70%) AND microphone commentary (30%) simultaneously."
                         else -> "Video recorded with no sound."
                     },
                     style = MaterialTheme.typography.bodySmall,
@@ -1366,7 +1359,6 @@ private fun DriveTabScreen(
 private fun SettingsTabScreen(
     deviceProfile: com.example.model.DeviceProfile?,
     thermalStatus: com.example.system.ThermalStatusInfo = com.example.system.ThermalStatusInfo(),
-    liveStreamHistory: List<com.example.model.LiveStreamHistoryItem> = emptyList(),
     themeMode: String = "SYSTEM",
     resolution: String,
     fps: Int,
@@ -1508,179 +1500,6 @@ private fun SettingsTabScreen(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                }
-            }
-        }
-
-        // Live Stream History Card (Permanent, cannot be deleted)
-        item {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RoundedCornerShape(16.dp))
-                    .testTag("live_stream_history_section")
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                painter = painterResource(id = R.drawable.ic_live_broadcast),
-                                contentDescription = null,
-                                modifier = Modifier.size(20.dp),
-                                tint = Color(0xFFE50914)
-                            )
-                            Text(
-                                text = "Live Stream History",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                        }
-
-                        Surface(
-                            shape = RoundedCornerShape(12.dp),
-                            color = MaterialTheme.colorScheme.surface,
-                            border = androidx.compose.foundation.BorderStroke(
-                                1.dp,
-                                MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
-                            )
-                        ) {
-                            Text(
-                                text = "${liveStreamHistory.size} Broadcast${if (liveStreamHistory.size == 1) "" else "s"}",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                            )
-                        }
-                    }
-
-                    Text(
-                        text = "Permanent audit log of all live broadcasts (Platform, Date, Format, Output Resolution & Frame Rate). This history cannot be deleted.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    if (liveStreamHistory.isEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(MaterialTheme.colorScheme.surface)
-                                .padding(16.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "No live broadcasts recorded yet. Start streaming from the Live tab to log your history here.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                            )
-                        }
-                    } else {
-                        Column(
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            liveStreamHistory.forEach { item ->
-                                val platformColor = when (item.platform.uppercase()) {
-                                    "YOUTUBE" -> Color(0xFFFF0000)
-                                    "TWITCH" -> Color(0xFF9146FF)
-                                    "FACEBOOK" -> Color(0xFF1877F2)
-                                    "INSTAGRAM" -> Color(0xFFE1306C)
-                                    else -> Color(0xFF8E8E93)
-                                }
-
-                                Surface(
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = MaterialTheme.colorScheme.surface,
-                                    border = androidx.compose.foundation.BorderStroke(
-                                        1.dp,
-                                        MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
-                                    ),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Column(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(12.dp),
-                                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Surface(
-                                                shape = RoundedCornerShape(6.dp),
-                                                color = platformColor.copy(alpha = 0.15f),
-                                                border = androidx.compose.foundation.BorderStroke(
-                                                    1.dp,
-                                                    platformColor.copy(alpha = 0.6f)
-                                                )
-                                            ) {
-                                                Text(
-                                                    text = item.platform,
-                                                    fontSize = 11.sp,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = platformColor,
-                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                                )
-                                            }
-
-                                            Text(
-                                                text = item.dateFormatted,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
-                                        }
-
-                                        Text(
-                                            text = item.streamTitle,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
-
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text(
-                                                text = "${item.resolution} @ ${item.fps} FPS (${item.bitrateMbps} Mbps) • ${item.orientation}",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.primary,
-                                                fontWeight = FontWeight.Medium
-                                            )
-                                        }
-
-                                        Text(
-                                            text = "Endpoint: ${item.streamServer}",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                                            maxLines = 1,
-                                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }

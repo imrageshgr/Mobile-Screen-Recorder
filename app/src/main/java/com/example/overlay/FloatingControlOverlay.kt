@@ -46,7 +46,6 @@ import com.example.R
 class FloatingControlOverlay(
     private val context: Context,
     private val shortClipDurationSeconds: Int = 30,
-    private val isLiveStream: Boolean = false,
     private val isMicInitialActive: Boolean = false,
     private val onPauseClick: () -> Unit = {},
     private val onResumeClick: () -> Unit = {},
@@ -64,7 +63,6 @@ class FloatingControlOverlay(
     ) : this(
         context = context,
         shortClipDurationSeconds = 30,
-        isLiveStream = false,
         isMicInitialActive = false,
         onPauseClick = onPauseResumeClick,
         onResumeClick = onPauseResumeClick,
@@ -363,7 +361,7 @@ class FloatingControlOverlay(
                 iconRes = R.drawable.ic_overlay_stop,
                 tintColor = Color.WHITE,
                 bgColor = Color.parseColor("#E02424"),
-                contentDesc = if (isLiveStream) "Stop Live Stream" else "Stop and Save Recording"
+                contentDesc = "Stop and Save Recording"
             ) {
                 triggerFinishAndSave()
             }

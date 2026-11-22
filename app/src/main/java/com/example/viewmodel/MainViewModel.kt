@@ -35,10 +35,40 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
+
+    companion object {
+        const val MODE_NORMAL = "NORMAL"
+        const val MODE_GAME = "GAME"
+
+        fun getAvailableAudioSourcesForMode(mode: String): List<String> {
+            return when (mode.uppercase()) {
+                MODE_NORMAL -> listOf(
+                    ScreenRecordService.AUDIO_SOURCE_INTERNAL,
+                    ScreenRecordService.AUDIO_SOURCE_BOTH
+                )
+                else -> listOf(
+                    ScreenRecordService.AUDIO_SOURCE_MUTE,
+                    ScreenRecordService.AUDIO_SOURCE_INTERNAL,
+                    ScreenRecordService.AUDIO_SOURCE_BOTH,
+                    ScreenRecordService.AUDIO_SOURCE_MIC
+                )
+            }
+        }
+
+        fun resolveAudioSourceForMode(mode: String, currentSource: String): String {
+            val validSources = getAvailableAudioSourcesForMode(mode)
+            return if (currentSource in validSources) {
+                currentSource
+            } else {
+                ScreenRecordService.AUDIO_SOURCE_INTERNAL
+            }
+        }
+    }
 
     private val videoRepository = VideoRepository(application.applicationContext)
     private val legacyRepository = RecordingRepository(application.applicationContext)
@@ -60,12 +90,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val driveAccountEmail: StateFlow<String> = dataStore.driveAccountEmail
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "")
 
-    val liveStreamConfig: StateFlow<com.example.model.LiveStreamConfig> = dataStore.liveStreamConfig
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), com.example.model.LiveStreamConfig())
-
-    val liveStreamHistory: StateFlow<List<com.example.model.LiveStreamHistoryItem>> = dataStore.liveStreamHistory
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
     val selectedResolution: StateFlow<String> = dataStore.selectedResolution
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "1080p")
 
@@ -75,8 +99,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val selectedBitrate: StateFlow<Int> = dataStore.selectedBitrate
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 12_000_000)
 
+    val recordingMode: StateFlow<String> = dataStore.recordingMode
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MODE_GAME)
+
+    val availableAudioSources: StateFlow<List<String>> = recordingMode
+        .map { mode -> getAvailableAudioSources(mode) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), getAvailableAudioSourcesForMode(MODE_GAME))
+
     val selectedAudioSource: StateFlow<String> = dataStore.selectedAudioSource
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "INTERNAL")
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ScreenRecordService.AUDIO_SOURCE_INTERNAL)
 
     val selectedOrientation: StateFlow<String> = dataStore.selectedOrientation
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "LANDSCAPE")
@@ -223,69 +254,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun updateLiveStreamConfig(config: com.example.model.LiveStreamConfig) {
-        viewModelScope.launch {
-            dataStore.saveLiveStreamConfig(config)
-        }
-    }
-
-    fun updateStreamPlatform(platform: String) {
-        viewModelScope.launch {
-            val current = liveStreamConfig.value
-            val defaultUrl = com.example.model.LiveStreamConfig.getDefaultUrlForPlatform(platform)
-            dataStore.saveLiveStreamConfig(current.copy(platform = platform, streamUrl = defaultUrl))
-        }
-    }
-
-    fun updateStreamCredentials(url: String, key: String, title: String) {
-        viewModelScope.launch {
-            val current = liveStreamConfig.value
-            dataStore.saveLiveStreamConfig(current.copy(streamUrl = url.trim(), streamKey = key.trim(), streamTitle = title.trim()))
-        }
-    }
-
-    fun updateStreamOrientation(orientation: String) {
-        viewModelScope.launch {
-            val current = liveStreamConfig.value
-            dataStore.saveLiveStreamConfig(current.copy(orientation = orientation))
-        }
-    }
-
-    fun toggleLayoutEnabled(enabled: Boolean) {
-        viewModelScope.launch {
-            val current = liveStreamConfig.value
-            dataStore.saveLiveStreamConfig(current.copy(isLayoutEnabled = enabled))
-        }
-    }
-
-    fun recordLiveStreamSession(resolution: String, fps: Int, bitrate: Int) {
-        viewModelScope.launch {
-            val config = liveStreamConfig.value
-            val platformLabel = when (config.platform) {
-                com.example.model.LiveStreamConfig.PLATFORM_YOUTUBE -> "YouTube Live"
-                com.example.model.LiveStreamConfig.PLATFORM_TWITCH -> "Twitch"
-                com.example.model.LiveStreamConfig.PLATFORM_FACEBOOK -> "Facebook Gaming"
-                com.example.model.LiveStreamConfig.PLATFORM_INSTAGRAM -> "Instagram Live"
-                else -> "Custom RTMP"
-            }
-            val orientationLabel = if (config.orientation == "HORIZONTAL") "16:9 Landscape" else "9:16 Vertical"
-            val dateFormat = java.text.SimpleDateFormat("MMM dd, yyyy • hh:mm a", java.util.Locale.getDefault())
-            val dateStr = dateFormat.format(java.util.Date())
-
-            val historyItem = com.example.model.LiveStreamHistoryItem(
-                platform = platformLabel,
-                streamTitle = if (config.streamTitle.isNotBlank()) config.streamTitle else "Mobile Game Live Broadcast",
-                dateFormatted = dateStr,
-                resolution = resolution,
-                fps = fps,
-                bitrateMbps = bitrate / 1_000_000,
-                orientation = orientationLabel,
-                streamServer = config.streamUrl.substringBefore("?").take(45)
-            )
-            dataStore.addLiveStreamHistoryItem(historyItem)
-        }
-    }
-
     fun setResolution(res: String) {
         viewModelScope.launch {
             dataStore.setSelectedResolution(res)
@@ -304,9 +272,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun getAvailableAudioSources(mode: String = recordingMode.value): List<String> {
+        return getAvailableAudioSourcesForMode(mode)
+    }
+
+    fun setRecordingMode(mode: String) {
+        val normalizedMode = if (mode.equals(MODE_NORMAL, ignoreCase = true)) MODE_NORMAL else MODE_GAME
+        viewModelScope.launch {
+            dataStore.setRecordingMode(normalizedMode)
+            val currentAudio = dataStore.selectedAudioSource.first()
+            val resolvedAudio = resolveAudioSourceForMode(normalizedMode, currentAudio)
+            if (resolvedAudio != currentAudio) {
+                dataStore.setSelectedAudioSource(resolvedAudio)
+            }
+        }
+    }
+
     fun setAudioSource(source: String) {
         viewModelScope.launch {
-            dataStore.setSelectedAudioSource(source)
+            val mode = dataStore.recordingMode.first()
+            val validSource = resolveAudioSourceForMode(mode, source)
+            dataStore.setSelectedAudioSource(validSource)
         }
     }
 
